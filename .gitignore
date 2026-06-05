@@ -1,0 +1,30 @@
+# Node / extensions
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Python / training
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Data & model artifacts (large; regenerated)
+dataset/
+models/
+*.pt
+*.onnx
+runs/
+
+# Local env / secrets (machine-specific paths)
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local test export dump
+TestExportWav/
+
+# Local Claude Code settings
+.claude/settings.local.json

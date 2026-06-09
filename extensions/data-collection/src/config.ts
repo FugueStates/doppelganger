@@ -17,10 +17,28 @@ export const TRACK_PREFIX = "op_";
 /** How many Operator tracks the rack contains (= samples per export). */
 export const NUM_TRACKS = 64;
 
-/** The MIDI note every track plays (fixed C3 for now; pitch/velocity variation is a
- *  later enrichment that also needs inference-side pitch handling). */
-export const NOTE_PITCH = 60; // C3 in Live's convention
+/**
+ * Played note + velocity.
+ *
+ * We now VARY the note and velocity per sample (each was previously fixed at C3/100),
+ * so the renderer can be conditioned on pitch — Operator's timbre is NOT pitch-invariant
+ * (Fixed-frequency operators and the absolute-Hz filter change the sound with the note),
+ * and velocity modulates level/FM index. The chosen note+velocity are recorded per sample
+ * in the manifest -> dataset JSON so training (Batch 5) can condition on them.
+ *
+ * Set RANDOMIZE_NOTE = false to fall back to the old fixed C3/100 behavior.
+ */
+export const NOTE_PITCH = 60; // C3 — fallback / initial-clip note (Live's convention)
 export const NOTE_VELOCITY = 100;
+export const RANDOMIZE_NOTE = true;
+/** MIDI note range to sample from. 36..84 = C1..C5 — most synth-usable pitches; the very
+ *  top is where 16 kHz capture starts losing bright FM partials above the 8 kHz Nyquist. */
+export const NOTE_PITCH_MIN = 36;
+export const NOTE_PITCH_MAX = 84;
+/** Velocity range. Kept moderately high so velocity->level scaling doesn't push presets
+ *  below the RMS audibility filter (which would waste renders). */
+export const VELOCITY_MIN = 70;
+export const VELOCITY_MAX = 127;
 /** Note length: SHORT relative to the render so the release tail is captured.
  *  3 beats = 1.5 s note, then note-off + release within a 3 s render. Without this
  *  the held note filled the whole render and decay/release params were unhearable. */

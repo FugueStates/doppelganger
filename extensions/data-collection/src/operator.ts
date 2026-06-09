@@ -20,6 +20,11 @@ import {
   NOTE_PITCH,
   NOTE_VELOCITY,
   NOTE_BEATS,
+  RANDOMIZE_NOTE,
+  NOTE_PITCH_MIN,
+  NOTE_PITCH_MAX,
+  VELOCITY_MIN,
+  VELOCITY_MAX,
   SAMPLING_RULES,
 } from "./config.js";
 
@@ -87,6 +92,37 @@ function chooseValue(param: DeviceParameter<ApiVersion>): number {
 
 /** Per-track record of the raw parameter values that were applied. */
 export type TrackParams = Record<string, number>;
+
+/** Per-track played-note record (pitch is a MIDI note number; velocity 0..127). */
+export type NoteInfo = { pitch: number; velocity: number };
+
+/** Inclusive random integer in [lo, hi]. */
+function randInt(lo: number, hi: number): number {
+  return lo + Math.floor(Math.random() * (hi - lo + 1));
+}
+
+/**
+ * Re-randomizes the played note + velocity on every rack track for this batch by
+ * REPLACING each track's clip (clear the [0, NOTE_BEATS) range, then create a fresh
+ * one-note clip). Uses only the same primitives buildRack already relies on, so it's
+ * robust for long unattended runs. Returns track name -> { pitch, velocity } for the
+ * manifest. With RANDOMIZE_NOTE = false it pins the old fixed C3/100 note.
+ */
+export async function randomizeNotes(
+  context: Ctx,
+  tracks: MidiTrack<ApiVersion>[],
+): Promise<Record<string, NoteInfo>> {
+  const recorded: Record<string, NoteInfo> = {};
+  for (const track of tracks) {
+    const pitch = RANDOMIZE_NOTE ? randInt(NOTE_PITCH_MIN, NOTE_PITCH_MAX) : NOTE_PITCH;
+    const velocity = RANDOMIZE_NOTE ? randInt(VELOCITY_MIN, VELOCITY_MAX) : NOTE_VELOCITY;
+    await track.clearClipsInRange(0, NOTE_BEATS);
+    const clip = await track.createMidiClip(0, NOTE_BEATS);
+    clip.notes = [{ pitch, startTime: 0, duration: NOTE_BEATS, velocity }];
+    recorded[track.name] = { pitch, velocity };
+  }
+  return recorded;
+}
 
 /**
  * Randomizes every parameter on every rack track in a single transaction.

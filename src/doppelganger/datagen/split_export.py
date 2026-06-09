@@ -96,6 +96,7 @@ def process_batch(
     out_param_dir.mkdir(parents=True, exist_ok=True)
 
     tracks_params: dict = manifest.get("tracks", {})
+    notes: dict = manifest.get("notes", {})  # {track: {pitch, velocity}}; absent = legacy C3
     written = 0
     idx = start_index
 
@@ -106,11 +107,14 @@ def process_batch(
             print(f"  ! no manifest params for {track.track_name}, skipping")
             continue
 
+        note = notes.get(track.track_name, {})
         name = f"{idx:07d}"
         dest_wav = out_wav_dir / f"{name}.wav"
         shutil.copy2(track.wav_path, dest_wav)
         (out_param_dir / f"{name}.json").write_text(
-            json.dumps({"track": track.track_name, "params": params}, indent=2),
+            json.dumps({"track": track.track_name, "params": params,
+                        "note": int(note.get("pitch", 60)),
+                        "velocity": int(note.get("velocity", 100))}, indent=2),
             encoding="utf-8",
         )
         if delete_source:
@@ -167,6 +171,7 @@ def process_pending(
 
     idx = _next_index(state_file)
     tracks_params = manifest.get("tracks", {})
+    notes = manifest.get("notes", {})  # {track: {pitch, velocity}}; absent for legacy C3 batches
     written = skipped_quiet = skipped_missing = 0
 
     for track in discover_export(batch_dir, prefix, track_prefix="op_"):
@@ -180,11 +185,15 @@ def process_pending(
             skipped_quiet += 1
             continue
 
+        # played note: from the manifest, else legacy default C3 (MIDI 60) / velocity 100
+        note = notes.get(track.track_name, {})
         name = f"{idx:07d}"
         shutil.copy2(track.wav_path, out_wav / f"{name}.wav")
         (out_param / f"{name}.json").write_text(
             json.dumps(
-                {"track": track.track_name, "batch": prefix, "params": params}, indent=2
+                {"track": track.track_name, "batch": prefix, "params": params,
+                 "note": int(note.get("pitch", 60)),
+                 "velocity": int(note.get("velocity", 100))}, indent=2
             ),
             encoding="utf-8",
         )

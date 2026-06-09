@@ -2,11 +2,63 @@
 
 > Synth sound-matching for Ableton Live, inspired by Synplant 2's *Genopatch*: feed in an audio sample (≤ ~5 s) and get the closest-matching preset for a selected built-in instrument. **v1 target: Operator.** Architecture must generalize to other instruments later.
 
-Status legend: 🔴 blocked/needs decision · 🟡 design pending validation · 🟢 ready to build
+Status legend: 🔴 blocked/needs decision · 🟡 design pending validation · 🟢 ready to build · ✅ done · 🔵 in progress
 
 ---
 
-## 0. TL;DR of where this stands
+# ★ CURRENT PLAN (v3, 2026-06) — supersedes §0–§10 below
+
+> The original plan (one-shot **mel→params regression**, §4) was proven to **fail for FM** — many-to-one param→sound + param-loss ≠ perception → chance-level validation (see [[training-findings]], `docs/approach.md`). The project pivoted to an **audio-objective** approach. The sections below (§0–§10) are kept as **history**.
+
+## The approach (Genopatch-style, audio-objective)
+
+```
+            ┌────────────────────────────────────────────────────────────────┐
+            │ A. NEURAL RENDERER (the differentiable Operator surrogate)        │
+real        │   params (+pitch/vel)  →  HybridRenderer  →  predicted log-mag    │
+Operator →  │     gray-box: DiffOperator physics core + FiLM neural residual    │  ← we are here
+renders     │   trained on (params, real-Operator audio); frozen when faithful  │
+(dataset)   └───────────────────────────────┬────────────────────────────────┘
+                                             │ provides a differentiable AUDIO loss
+            ┌────────────────────────────────▼───────────────────────────────┐
+            │ B. ONE-SHOT MATCHER (conditional diffusion over params)          │
+            │   input audio → params, trained with audio loss THROUGH the      │
+            │   frozen renderer (param loss = nudge, audio loss = driver)      │
+            └────────────────────────────────┬────────────────────────────────┘
+                                             │ seed preset
+            ┌────────────────────────────────▼───────────────────────────────┐
+            │ C. INFERENCE POLISH (optional): short CMA-ES against the REAL    │
+            │   Operator to refine the seed (search.py pipeline exists)        │
+            └─────────────────────────────────────────────────────────────────┘
+```
+Why this works where regression failed: the **forward** map (params→sound) is a well-posed function and **is** learnable; we optimize for **sound**, not parameter values; the real Operator stays the final authority (renderer is a training aid; CMA-ES polish + the applied preset use real Operator).
+
+## Phases & status
+
+**Phase A — Neural renderer (IN PROGRESS 🔵).** Validate fidelity by **energy-weighted / loud-bin log-mag** vs a predict-the-mean baseline (`inspect_renderer.py`); the loud bins are what the matcher's gradient rides on. SoTA built in attributable batches:
+- **Batch 1 ✅ VALIDATED** — multi-resolution STFT output (512/1024/2048) + spectral-convergence + **frequency-transport (1-D Wasserstein) loss** (places sidebands at the right bin) + **EMA**. Loud-bin gap-closed vs mean **+28.9% → +42.0%**.
+- **Batch 2 ✅ BUILT (awaiting fresh train run)** — physics core: **anti-aliased** oversampled rendering + **bounded learnable calibration** (fm depth, envelope times, per-segment curvature) so the prior self-calibrates via the spectral loss. Watch the `phys` columns drop.
+- **Batch 3 🟢** — preset-tokenizer + small **Transformer** conditioning encoder (best on Dexed FM in the Neural-Proxies work) replacing the MLP.
+- **Batch 4 🟢** — capacity / `alpha` sweep + optional **spectrogram adversarial** polish if outputs over-smooth.
+- **Batch 5 🟡 — PITCH/VELOCITY CONDITIONING** (see below). Gate: pitch-conditioned renderer must match single-pitch quality, then generalize.
+
+**Phase B — One-shot diffusion matcher (🟡 NEXT after renderer is faithful).** Conditional diffusion / flat-vector denoiser (MLP/Transformer, NOT 2-D U-Net) over the normalized param vector, conditioned on the input audio embedding; trained with the **magnitude-weighted audio loss backpropped through the frozen renderer** + a small param-supervision nudge. Clamp modulation index (I_max≈2) for the matcher's gradient stability only.
+
+**Phase C — Sim-to-real polish (🟡 LATER).** Short in-the-loop **CMA-ES against the real Operator** (`search.py`, population 64 = one export) to refine the matcher's seed; optional online renderer fine-tuning on fresh real renders.
+
+## Pitch & velocity (decided 2026-06-09)
+Operator timbre is **not** pitch-invariant (Fixed-freq operators + the absolute-Hz filter change with the note; velocity modulates level/FM index). Plan: **condition the model on pitch** (and velocity) rather than fight it.
+- **Data (✅ collector updated):** `extensions/data-collection` now **randomizes the MIDI note (36–84) and velocity (70–127) per sample** and records them through the manifest into each sample JSON (`note`, `velocity`). One random pitch per preset = full coverage at the **same dataset size** (no N× blow-up); it also adds preset diversity. Existing 47k C3 samples stay valid as the `note=60` examples.
+- **Existing dataset:** **no metadata migration needed** — the loader will default a missing `note` to 60 (C3) / `velocity` 100. New data carries the fields.
+- **Model (Batch 5, not yet built):** thread `f0` (and velocity) through `DiffOperator` (drop the hardcoded 261.63; the physics already scales every frequency by f0 → cheap), `RendererConfig`, the dataset loader, and the conditioning encoder. At inference, detect input f0 (YIN/autocorrelation on monophonic synth sounds) and render/match at that pitch.
+- **Recommended additional samples:** ~**50k** random-pitch renders (≈ doubles the set; ~1k/semitone over 36–84), targeting ~100k total. ~25k is a usable minimum; up to ~100k new if we want C3 to be a clear minority. Move this to the 3090 box together at Batch 5.
+
+## Infra
+2×3090 + NVLink box for training. `train_renderer.py` does **DDP auto-spawn** (NCCL on Linux, gloo on Windows); torch pinned **cu124** (matches the box's CUDA 12.4 driver; also runs on the 4070). `inspect_renderer.py` is the renderer go/no-go. Source of truth = `origin/dev` (user handles all git).
+
+---
+
+## 0. TL;DR of where this stands  *(history below — see CURRENT PLAN above)*
 
 Two research passes are done: (a) the **Ableton Extensions SDK** is mapped and the API verified against source; (b) the **synth sound-matching ML literature** is summarized. Two things dominate the design:
 

@@ -36,8 +36,8 @@ import {
   SWEEPS_DIR,
   SEARCH_DIR,
 } from "./config.js";
-import { buildRack, findOperatorTracks, randomizeAll, applyParams } from "./operator.js";
-import { nextBatchId, writeManifest } from "./batch.js";
+import { buildRack, findOperatorTracks, randomizeAll, randomizeNotes, applyParams } from "./operator.js";
+import { nextBatchId, writeManifest, type BatchInfo } from "./batch.js";
 import { report, formatError } from "./report.js";
 
 type Ctx = ReturnType<typeof initialize>;
@@ -215,8 +215,9 @@ async function runAutoCollect(context: Ctx): Promise<void> {
     }
 
     const recorded = await randomizeAll(context, tracks);
+    const notes = await randomizeNotes(context, tracks);
     const batchId = await nextBatchId();
-    const info = await writeManifest(batchId, recorded);
+    const info = await writeManifest(batchId, recorded, notes);
     await fs.writeFile(path.join(info.batchDir, "READY"), "", "utf8");
     console.log(`[doppelganger] ${batchId} READY — waiting for export…`);
 
@@ -281,16 +282,17 @@ async function runRandomizeBatch(context: Ctx): Promise<void> {
       return;
     }
 
-    let info;
+    let info: BatchInfo | undefined;
     await context.ui.withinProgressDialog(
       "Randomizing batch",
       { progress: 0 },
       async (update) => {
         update(`Randomizing ${tracks.length} tracks…`, 40);
         const recorded = await randomizeAll(context, tracks);
+        const notes = await randomizeNotes(context, tracks);
         update("Writing manifest…", 80);
         const batchId = await nextBatchId();
-        info = await writeManifest(batchId, recorded);
+        info = await writeManifest(batchId, recorded, notes);
         update("Done", 100);
       },
     );

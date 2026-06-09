@@ -10,7 +10,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 
 import { PENDING_DIR, STATE_FILE, INSTRUMENT_NAME, RENDER_SECONDS } from "./config.js";
-import type { TrackParams } from "./operator.js";
+import type { TrackParams, NoteInfo } from "./operator.js";
 
 interface State {
   next: number;
@@ -44,10 +44,13 @@ export interface BatchInfo {
   trackCount: number;
 }
 
-/** Writes the manifest for a batch and returns where everything lives. */
+/** Writes the manifest for a batch and returns where everything lives.
+ *  `notes` (optional) maps track name -> { pitch, velocity } so the played note is
+ *  recorded per sample alongside the params (consumed by split_export). */
 export async function writeManifest(
   batchId: string,
   tracks: Record<string, TrackParams>,
+  notes?: Record<string, NoteInfo>,
 ): Promise<BatchInfo> {
   const batchDir = path.join(PENDING_DIR, batchId);
   await fs.mkdir(batchDir, { recursive: true });
@@ -59,6 +62,7 @@ export async function writeManifest(
     renderSeconds: RENDER_SECONDS,
     trackCount: Object.keys(tracks).length,
     tracks,
+    notes: notes ?? {},
   };
 
   const manifestPath = path.join(batchDir, "manifest.json");

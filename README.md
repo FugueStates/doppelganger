@@ -6,12 +6,19 @@ the **real** Ableton Operator (no clone).
 
 It has three parts:
 1. **Data collection** — an Ableton Extension builds many Operator tracks with random
-   params; Ableton's offline multitrack **Export Audio** renders them; Python splits the
-   export into `(audio, params)` training pairs.
-2. **Training** — PyTorch model: log-mel spectrogram → ResNet → 195 Operator parameter
-   heads (continuous params via binned classification, binary/categorical via BCE/CE).
-3. **Inference** *(in progress)* — an Ableton Extension runs the model (onnxruntime-node)
-   and applies the predicted preset to a selected Operator.
+   params (and now random note + velocity per sample); Ableton's offline multitrack
+   **Export Audio** renders them; Python splits the export into `(audio, params)` pairs.
+2. **Training (audio-objective)** — the current approach optimizes for **sound**, not
+   parameter values (direct param regression was proven to fail for FM). A **neural
+   renderer** (`synth/`) learns `params → spectrogram` from real-Operator audio; once
+   faithful it provides a differentiable **audio loss** to train a one-shot **diffusion
+   matcher** (`input audio → params`). See `docs/PLAN.md` → *CURRENT PLAN (v3)*.
+3. **Inference** *(in progress)* — an Ableton Extension runs the matcher and applies the
+   predicted preset to a selected Operator, optionally refined by an in-the-loop
+   CMA-ES search against the real Operator.
+
+> **Note:** the original `training/` param-regression pipeline (log-mel → ResNet → param
+> heads) is **deprecated** — kept for reference only. The live work is in `synth/`.
 
 See [docs/PLAN.md](docs/PLAN.md) for the full design and rationale, and
 [.claude/skills/ableton-extensions-sdk/SKILL.md](.claude/skills/ableton-extensions-sdk/SKILL.md)
@@ -45,10 +52,13 @@ doppelganger/
   src/doppelganger/                    Python package (uv)
     schema.py  audio.py
     datagen/   split_export.py  export_ableton.py  run_loop.py
-    training/  config.py features.py codec.py data.py model.py
-               train.py eval.py diagnose.py hear_it.py
-  dataset/operator/{wav,params}/       generated dataset (gitignored)
-  models/operator/model.pt             trained checkpoint
+    synth/     renderer.py train_renderer.py inspect_renderer.py   ← CURRENT (audio-objective)
+               diff_operator.py spectral.py adapter.py sensitivity.py
+               search.py sweeps.py run_sweeps.py calibrate.py
+    training/  (DEPRECATED param-regression: config/features/codec/data/model/train/eval/…)
+  dataset/operator/{wav,params}/       generated dataset (gitignored; params JSON now also
+                                       records `note` + `velocity` per sample)
+  models/operator/renderer.pt          trained neural-renderer checkpoint
   runs/                                TensorBoard logs
 ```
 
@@ -105,9 +115,11 @@ params). Re-run only if Operator's parameters change.
 ### Manual loop (good for testing)
 In Live (data-collection extension loaded), right-click a MIDI track:
 1. **"doppelganger: Build Operator Rack"** — once; creates `NUM_TRACKS` (64) `op_0000…`
-   tracks, each with Operator + a C3 note.
-2. **"doppelganger: Randomize Batch"** — randomizes all params, writes
-   `dataset/pending/<batchId>/manifest.json`, and tells you the export prefix/folder.
+   tracks, each with Operator + a note clip.
+2. **"doppelganger: Randomize Batch"** — randomizes all params **and the note + velocity
+   per track** (pitch 36–84, velocity 70–127; see `config.ts`), writes
+   `dataset/pending/<batchId>/manifest.json` (params + a `notes` map), and tells you the
+   export prefix/folder. The chosen note/velocity land in each sample's params JSON.
 3. **Export Audio** (`Ctrl+Shift+R`) → **Rendered Track: All Individual Tracks**, ~3 s,
    name prefix = the batch id, save into that batch folder. *(Set this once; Live
    remembers it.)*
@@ -145,60 +157,67 @@ rules, `MAX_BATCHES`) — rebuild with `npm run package` / re-run `npm start` af
 
 ---
 
-## Tool 2 — Training
+## Tool 2 — Neural renderer (current, audio-objective)
+
+Trains the differentiable Operator surrogate `params → multi-resolution log-mag spectrogram`
+on the `(params, real-Operator audio)` dataset. Its held-out **loud-bin fidelity** is the
+go/no-go for building the diffusion matcher on top.
 
 ```powershell
 cd D:\AbletonExtensions\doppelganger
+uv sync --extra train        # PyTorch (cu124) + scipy + tensorboard
 
-# train on dataset/operator (GPU if available); checkpoint -> models/operator/model.pt
-uv run python -m doppelganger.training.train --epochs 60 --batch-size 64 --lr 1e-3 --run-name resnet_binned_v1
+# train; checkpoint -> models/operator/renderer.pt (EMA weights). AUTO-USES ALL GPUs (DDP):
+#   2x3090 box -> one process per GPU over NVLink automatically, no extra flags.
+uv run python -m doppelganger.synth.train_renderer --epochs 80
 
-# sanity: should memorize a tiny subset (cont_mae -> ~0)
-uv run python -m doppelganger.training.train --overfit 64 --epochs 300
-
-# monitor (train vs val curves)
-uv run tensorboard --logdir runs        # http://localhost:6006
-
-# evaluate a checkpoint (train vs val, with the predict-the-mean baseline)
-uv run python -m doppelganger.training.eval
-
-# per-parameter accuracy (which params are learnable)
-uv run python -m doppelganger.training.diagnose
+#   single GPU / CPU is the same command (falls through to one process).
+#   useful flags: --batch-size N (PER-GPU) --alpha 10 (loud-bin emphasis) --resume
+#                 --gpus 1 (force single) --limit 80 (tiny dev run) --out path.pt
 ```
 
-Audio/feature settings are in `training/config.py`; the model in `training/model.py`.
+**Validate fidelity** (the decisive metric — energy-weighted / top-10%-loud-bin log-mag L1
+vs a predict-the-mean baseline; runs single-process, fine on CPU):
+```powershell
+uv run python -m doppelganger.synth.inspect_renderer --n 512 --device cpu
+# look at "loud-bin gap closed vs mean" — higher = the renderer captures real sideband
+# structure (the gradient the matcher will ride on), not just the average sound.
+```
+
+Renderer/loss settings live in `synth/renderer.py` (`RendererConfig`: multi-res n_ffts,
+oversample, f0) and `synth/spectral.py` (energy-weighted + spectral-convergence +
+frequency-transport losses). The FM physics core is `synth/diff_operator.py`.
+
+> **One-shot matcher** (diffusion, `input audio → params`, trained through the frozen
+> renderer) is the next tool to build once renderer fidelity is locked — see `docs/PLAN.md`.
+
+### In-the-loop CMA-ES search (real Operator, optional inference polish)
+Refines a preset directly against the real Operator (population 64 = one export):
+```powershell
+uv run python -m doppelganger.synth.search --target "dataset\operator\wav\0000000.wav" --gens 40
+# then in Live: right-click -> "doppelganger: Run Search"
+```
 
 ---
 
-## The "hear it" evaluation (the metric that matters)
+## (Deprecated) Tool 2 v1 — param-regression
 
-Parameter accuracy is misleading (many settings sound alike). This re-renders the model's
-**predictions** in the real Operator and compares **audio**.
-
-```powershell
-# 1) predict params for K held-out samples -> dataset/predict/{manifest.json,targets/}
-uv run python -m doppelganger.training.hear_it predict --k 64
-```
-2. In Live: right-click → **"doppelganger: Apply Predicted Batch"** (sets the predicted
-   presets on the rack).
-3. Render them:
-   ```powershell
-   uv run python -m doppelganger.datagen.export_ableton export "dataset\predict\render" --expected 64
-   ```
-4. Compare (log-mel L1, matched vs shuffled baseline; ratio < 1 = capturing the sound):
-   ```powershell
-   uv run python -m doppelganger.training.hear_it compare
-   ```
-Then listen to `dataset/predict/targets/` vs `dataset/predict/render/`.
+The original log-mel → ResNet → param-head pipeline under `training/` is **kept for
+reference but no longer the path** (it hit a chance-level validation ceiling — many params
+sound alike, and param-loss ≠ perception; see `docs/approach.md` / `docs/PLAN.md`). Its
+commands (`training.train`, `training.eval`, `training.diagnose`, `training.hear_it`) still
+run but are not part of the current workflow.
 
 ---
 
 ## Status
 
-- ✅ Tool 1 (data collection) — working, automated; ~20k samples collected.
-- 🔄 Tool 2 (training) — ResNet + binned-classification model; iterating on data + loss.
-  Current audio baseline: hear-it ratio **0.72** (lower is better).
-- ⬜ Tool 3 (inference extension) — ONNX export + in-Live inference, not yet built.
+- ✅ Tool 1 (data collection) — automated; ~47k C3 samples; collector now varies note+velocity.
+- 🔵 Tool 2 (neural renderer) — training on 2×3090 (DDP). Batch 1 (multi-res + frequency-
+  transport loss + EMA) validated (+42% loud-bin gap); Batch 2 (anti-aliased + self-
+  calibrating physics core) built. Next: Transformer encoder, then pitch conditioning.
+- ⬜ One-shot diffusion matcher — after renderer fidelity is locked.
+- ⬜ Tool 3 (inference extension) — not yet built.
 
-See [docs/PLAN.md](docs/PLAN.md) for what's next (gating-mask loss, neural-proxy perceptual
-loss, richer stimuli, ONNX export, AST backbone, multi-GPU).
+See [docs/PLAN.md](docs/PLAN.md) → **CURRENT PLAN (v3)** for the full roadmap (renderer
+Batches 1–5, the diffusion matcher, sim-to-real polish, pitch/velocity conditioning).

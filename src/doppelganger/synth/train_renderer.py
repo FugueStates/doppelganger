@@ -16,7 +16,7 @@ import dataclasses
 import json
 import os
 import platform
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 import torch
@@ -156,6 +156,9 @@ def _parse_args():
     ap.add_argument("--alpha", type=float, default=10.0, help="loud-bin emphasis in the loss")
     ap.add_argument("--encoder", choices=["transformer", "mlp"], default=None,
                     help="conditioning encoder (default: RendererConfig's 'transformer'); 'mlp' for ablation")
+    ap.add_argument("--oversample", type=int, default=None, help="physics anti-alias factor (override cfg; 1 = off)")
+    ap.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True,
+                    help="bf16 mixed precision on CUDA (--no-amp to disable)")
     ap.add_argument("--ema-decay", type=float, default=0.999)
     ap.add_argument("--patience", type=int, default=10, help="early-stop after N epochs without val gain")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -181,9 +184,14 @@ def worker(rank: int, world_size: int, args):
         device = args.device
 
     torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True   # free Ampere speedup for fp32 matmuls
+    torch.backends.cudnn.allow_tf32 = True
+    use_amp = bool(args.amp) and device.startswith("cuda")  # bf16 autocast
     cfg = RendererConfig()
     if args.encoder:
         cfg = dataclasses.replace(cfg, encoder=args.encoder)
+    if args.oversample is not None:
+        cfg = dataclasses.replace(cfg, oversample=args.oversample)
     canon = cfg.canon_fft
     schema = OperatorSchema.load(root / "schemas" / "operator.json")
     ds = RendererDataset(Path(args.data), cfg)
@@ -233,6 +241,8 @@ def worker(rank: int, world_size: int, args):
         print(f"{schema.summary()} | train={len(tr)} val={len(va)} device={device} "
               f"world_size={world_size} backend={_ddp_backend() if distributed else 'single'} "
               f"| effective batch={args.batch_size * world_size}")
+        print(f"  encoder={cfg.encoder} ch={cfg.ch} blocks={cfg.n_blocks} oversample={cfg.oversample} "
+              f"amp={'bf16' if use_amp else 'off'} grad_ckpt={cfg.grad_checkpoint} tf32=on")
 
     for epoch in range(start_epoch, args.epochs + 1):
         if tr_sampler is not None:
@@ -240,8 +250,10 @@ def worker(rank: int, world_size: int, args):
         net.train()
         run = nb = 0.0
         for dicts, waves in tr_dl:
-            target = model.target_logmag(waves.to(device))
-            loss = renderer_loss(net(dicts, device), target, args.alpha)
+            target = model.target_logmag(waves.to(device))  # fp32 reference
+            with (torch.autocast("cuda", dtype=torch.bfloat16) if use_amp else nullcontext()):
+                preds = net(dicts, device)                  # heavy ops (conv/attn) in bf16
+            loss = renderer_loss({k: v.float() for k, v in preds.items()}, target, args.alpha)  # loss in fp32
             # NaN guard must agree across ranks (skipping on one rank only would deadlock DDP)
             bad = torch.tensor([0.0 if torch.isfinite(loss) else 1.0], device=device)
             if distributed:

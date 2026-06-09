@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
 from ..schema import OperatorSchema
 from .adapter import to_controls
@@ -47,6 +48,7 @@ class RendererConfig:
     tf_dim: int = 160                   # preset-tokenizer Transformer token width
     tf_layers: int = 3
     tf_heads: int = 8
+    grad_checkpoint: bool = True        # recompute residual blocks in backward (saves VRAM)
 
     @property
     def hops(self) -> tuple:
@@ -191,8 +193,11 @@ class HybridRenderer(nn.Module):
         B, _, n_freq, n_time = phys.shape
         x = torch.cat([phys, self._freq_encoding(n_freq, n_time, B, device)], dim=1)
         h = self.in_block(x, code)
+        ckpt = self.cfg.grad_checkpoint and self.training
         for blk in self.mid:
-            h = blk(h, code)
+            # checkpointing stores far fewer activations (recomputes them in backward) —
+            # the residual runs over 3 resolutions so this is the main VRAM lever.
+            h = checkpoint(blk, h, code, use_reentrant=False) if ckpt else blk(h, code)
         return (phys + self.out_conv(h)).squeeze(1)
 
     def forward(self, param_dicts: list[dict], device: str = "cpu",

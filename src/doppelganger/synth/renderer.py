@@ -38,6 +38,15 @@ class RendererConfig:
     note_off: float = 1.5
     f0: float = 261.63                  # Ableton MIDI 60
     oversample: int = 2                 # physics-core anti-aliasing (render at os x, LPF, decimate)
+    # --- conditioning + residual capacity (Batch 3/4) ---
+    encoder: str = "transformer"        # "transformer" (preset-tokenizer) or "mlp" (legacy)
+    code_dim: int = 256                 # FiLM conditioning vector width
+    ch: int = 64                        # residual CNN width (Batch 4 capacity: 48 -> 64)
+    n_blocks: int = 4                   # residual CNN mid-blocks (Batch 4 capacity: 3 -> 4)
+    dropout: float = 0.2
+    tf_dim: int = 160                   # preset-tokenizer Transformer token width
+    tf_layers: int = 3
+    tf_heads: int = 8
 
     @property
     def hops(self) -> tuple:
@@ -90,28 +99,72 @@ def _param_vector(param_dicts: list[dict], schema: OperatorSchema) -> torch.Tens
     return out.clamp(0, 1)
 
 
+class MlpConditioner(nn.Module):
+    """Legacy conditioner: normalized-param vector -> MLP -> code. Dropout stops the residual
+    from using the (near-unique) param vector as a per-sample lookup key."""
+
+    def __init__(self, n_params: int, code_dim: int, dropout: float):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_params, code_dim), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(code_dim, code_dim), nn.ReLU(), nn.Dropout(dropout),
+        )
+
+    def forward(self, vec):  # vec [B, n_params] in [0,1]
+        return self.net(vec)
+
+
+class PresetTransformerConditioner(nn.Module):
+    """Preset-tokenizer + Transformer conditioner (best on Dexed FM in the Neural-Proxies
+    work). Each parameter becomes a token = (which-param embedding) + (its value, lifted to
+    Fourier features so non-linear value->timbre effects are easy to model). A [CLS] token
+    summarizes the preset via self-attention over all params -> the FiLM code. Self-attention
+    lets the model reason about param INTERACTIONS (algorithm x ratio x level) the MLP can't.
+    Designed so pitch/velocity (Batch 5) slot in later as extra tokens."""
+
+    def __init__(self, n_params: int, code_dim: int, d: int, layers: int, heads: int,
+                 dropout: float, n_fourier: int = 6):
+        super().__init__()
+        self.param_id = nn.Embedding(n_params, d)            # which param this token is
+        self.register_buffer("freqs", (2.0 ** torch.arange(n_fourier)) * torch.pi)
+        self.value_proj = nn.Linear(2 * n_fourier, d)        # Fourier(value) -> token
+        self.cls = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        layer = nn.TransformerEncoderLayer(
+            d, heads, dim_feedforward=4 * d, dropout=dropout,
+            activation="gelu", batch_first=True, norm_first=True)
+        self.encoder = nn.TransformerEncoder(layer, layers, enable_nested_tensor=False)
+        self.out = nn.Linear(d, code_dim)
+        self.register_buffer("ids", torch.arange(n_params))
+
+    def forward(self, vec):  # vec [B, n_params] in [0,1]
+        B, _ = vec.shape
+        ff = vec.unsqueeze(-1) * self.freqs                  # [B, P, n_fourier]
+        ff = torch.cat([ff.sin(), ff.cos()], dim=-1)         # [B, P, 2*n_fourier]
+        tokens = self.value_proj(ff) + self.param_id(self.ids)[None]  # [B, P, d]
+        x = torch.cat([self.cls.expand(B, -1, -1), tokens], dim=1)    # prepend [CLS]
+        return self.out(self.encoder(x)[:, 0])               # CLS -> code [B, code_dim]
+
+
 class HybridRenderer(nn.Module):
-    def __init__(self, schema: OperatorSchema, cfg: RendererConfig | None = None,
-                 code_dim: int = 256, ch: int = 48, dropout: float = 0.2):
+    def __init__(self, schema: OperatorSchema, cfg: RendererConfig | None = None):
         super().__init__()
         self.schema = schema
         self.cfg = cfg or RendererConfig()
-        self.physics = DiffOperator(self.cfg.sample_rate, self.cfg.n_samples,
-                                    self.cfg.note_off, oversample=self.cfg.oversample)
+        c = self.cfg
+        self.physics = DiffOperator(c.sample_rate, c.n_samples, c.note_off, oversample=c.oversample)
         n_params = len(schema.params)
-        # Dropout on the conditioning code is the key anti-memorization regularizer: it stops
-        # the residual from using the (near-unique) param vector as a per-sample lookup key.
-        self.encoder = nn.Sequential(
-            nn.Linear(n_params, code_dim), nn.ReLU(), nn.Dropout(dropout),
-            nn.Linear(code_dim, code_dim), nn.ReLU(), nn.Dropout(dropout)
-        )
+        if c.encoder == "transformer":
+            self.encoder = PresetTransformerConditioner(
+                n_params, c.code_dim, c.tf_dim, c.tf_layers, c.tf_heads, c.dropout)
+        else:
+            self.encoder = MlpConditioner(n_params, c.code_dim, c.dropout)
         # Frequency positional encoding: a FiLM-CNN is translation-equivariant in frequency
         # and can't otherwise place a peak at a preset-specific absolute bin. These extra
         # channels (linear ramp + sinusoids) tell every conv WHERE in frequency it is.
         self.n_freqenc = 5  # 1 linear + 4 sinusoidal
-        self.in_block = FiLMBlock(1 + self.n_freqenc, ch, code_dim)
-        self.mid = nn.ModuleList([FiLMBlock(ch, ch, code_dim) for _ in range(3)])
-        self.out_conv = nn.Conv2d(ch, 1, 3, padding=1)
+        self.in_block = FiLMBlock(1 + self.n_freqenc, c.ch, c.code_dim)
+        self.mid = nn.ModuleList([FiLMBlock(c.ch, c.ch, c.code_dim) for _ in range(c.n_blocks)])
+        self.out_conv = nn.Conv2d(c.ch, 1, 3, padding=1)
 
     def _freq_encoding(self, n_freq: int, n_time: int, batch: int, device) -> torch.Tensor:
         """[B, n_freqenc, F, T] absolute-frequency coordinate channels."""

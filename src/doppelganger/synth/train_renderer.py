@@ -12,6 +12,7 @@ Requires dataset/operator (regenerate via Auto Collect first).
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import platform
@@ -153,6 +154,8 @@ def _parse_args():
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--alpha", type=float, default=10.0, help="loud-bin emphasis in the loss")
+    ap.add_argument("--encoder", choices=["transformer", "mlp"], default=None,
+                    help="conditioning encoder (default: RendererConfig's 'transformer'); 'mlp' for ablation")
     ap.add_argument("--ema-decay", type=float, default=0.999)
     ap.add_argument("--patience", type=int, default=10, help="early-stop after N epochs without val gain")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -179,6 +182,8 @@ def worker(rank: int, world_size: int, args):
 
     torch.backends.cudnn.benchmark = True
     cfg = RendererConfig()
+    if args.encoder:
+        cfg = dataclasses.replace(cfg, encoder=args.encoder)
     canon = cfg.canon_fft
     schema = OperatorSchema.load(root / "schemas" / "operator.json")
     ds = RendererDataset(Path(args.data), cfg)

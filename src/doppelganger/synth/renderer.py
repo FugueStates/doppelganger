@@ -37,6 +37,7 @@ class RendererConfig:
     canon_fft: int = 1024               # resolution used for headline metrics / mean baseline
     note_off: float = 1.5
     f0: float = 261.63                  # Ableton MIDI 60
+    oversample: int = 2                 # physics-core anti-aliasing (render at os x, LPF, decimate)
 
     @property
     def hops(self) -> tuple:
@@ -95,7 +96,8 @@ class HybridRenderer(nn.Module):
         super().__init__()
         self.schema = schema
         self.cfg = cfg or RendererConfig()
-        self.physics = DiffOperator(self.cfg.sample_rate, self.cfg.n_samples, self.cfg.note_off)
+        self.physics = DiffOperator(self.cfg.sample_rate, self.cfg.n_samples,
+                                    self.cfg.note_off, oversample=self.cfg.oversample)
         n_params = len(schema.params)
         # Dropout on the conditioning code is the key anti-memorization regularizer: it stops
         # the residual from using the (near-unique) param vector as a per-sample lookup key.

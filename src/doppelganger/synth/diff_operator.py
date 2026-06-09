@@ -2,17 +2,21 @@
 DiffOperator — a DIFFERENTIABLE FM synth that approximates Ableton Operator.
 
 This is the DDSP/"physics-informed" forward model: a torch reimplementation of
-Operator's FM topology (the *known physics* of phase-modulation synthesis), used to
-provide gradients/consistency losses the real (non-differentiable) Operator can't.
-Final params are still applied to the REAL Operator; this is a training aid + the
-clone experiment.
+Operator's FM topology (the *known physics* of phase-modulation synthesis). Inside the
+HybridRenderer it is the gray-box PRIOR — it places the FM sidebands; the neural residual
+corrects the remainder. Final params are still applied to the REAL Operator.
 
-v1 scope (calibrate, measure fidelity, then extend):
+v2 (the physics is now a strong, self-calibrating prior):
   • 4 sine operators (A,B,C,D), phase modulation, the 11 algorithm routings.
-  • Per-op ADSR amplitude envelopes with note-on/off (so release is modeled).
-  • Free CALIBRATION constants (FM depth scale, envelope time mapping) to fit to real
-    Operator. NOT yet modeled: additive/non-sine waveforms, filter, LFO, self-feedback,
-    pitch/velocity scaling. Add after the core FM calibrates.
+  • Per-op ADSR with note-on/off and PER-SEGMENT learnable curvature (Operator's envelopes
+    are curved, and attack/decay/release curve differently — the clone's "secret sauce").
+  • ANTI-ALIASED rendering: oversample -> windowed-sinc low-pass -> decimate, so high
+    modulation-index / high-ratio sidebands above Nyquist don't fold back to wrong bins
+    (which the residual cannot easily undo — aliased energy looks like real content).
+  • BOUNDED LEARNABLE calibration (fm depth, envelope times + curvature): trained jointly
+    with the residual via the spectral loss, so the prior calibrates itself. Bounded
+    (sigmoid x ceiling) to avoid the degeneracy a free least-squares fit showed.
+  Still not modeled: non-sine waveforms, filter, LFO, self-feedback, pitch/velocity.
 
 Operators are indexed 0=A,1=B,2=C,3=D. Edges are (modulator -> carrier).
 """
@@ -23,6 +27,7 @@ import math
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 # --- The 11 algorithm routings (CONFIRMED from Operator's UI icons) ----------
@@ -59,54 +64,127 @@ def _topo_order(edges: list[tuple[int, int]]) -> list[int]:
 
 @dataclass
 class CalibConstants:
-    fm_scale: float = 6.0       # maps op level -> radians of phase deviation (fit this)
-    max_attack: float = 2.0     # seconds at param=1 (fit)
+    """Fixed calibration (legacy path: calibrate.py / search.py pass this explicitly).
+    Inside the renderer these are LEARNED instead — see DiffOperator's bounded params."""
+    fm_scale: float = 6.0       # maps op level -> radians of phase deviation
+    max_attack: float = 2.0     # seconds at param=1
     max_decay: float = 3.0
     max_release: float = 4.0
-    env_curve: float = 4.0      # exponential curvature of envelope segments (Operator is curved)
+    env_curve: float = 4.0      # exponential curvature of envelope segments
 
 
 def adsr(
     a: torch.Tensor, d: torch.Tensor, s: torch.Tensor, r: torch.Tensor,
-    t: torch.Tensor, note_off: float, cc: CalibConstants,
+    t: torch.Tensor, note_off: float,
+    max_a, max_d, max_r, curve_a, curve_d, curve_r,
 ) -> torch.Tensor:
     """Differentiable ADSR with EXPONENTIAL (curved) segments, like Operator.
-    a/d/s/r are [B] in [0,1]; t is [T] seconds. Returns [B, T].
-    Each segment v0->v1 over time T: v(p) = v1 + (v0-v1)*exp(-k*p), p in [0,1]."""
-    k = cc.env_curve
-    a_t = (a * cc.max_attack).clamp(min=1e-3).unsqueeze(1)   # [B,1]
-    d_t = (d * cc.max_decay).clamp(min=1e-3).unsqueeze(1)
-    r_t = (r * cc.max_release).clamp(min=1e-3).unsqueeze(1)
+    a/d/s/r are [B] in [0,1]; t is [T] seconds. max_*/curve_* are scalars (float or
+    learnable tensor). Each segment v0->v1 over time T: v(p)=v1+(v0-v1)*exp(-k*p)."""
+    a_t = (a * max_a).clamp(min=1e-3).unsqueeze(1)   # [B,1]
+    d_t = (d * max_d).clamp(min=1e-3).unsqueeze(1)
+    r_t = (r * max_r).clamp(min=1e-3).unsqueeze(1)
     s = s.unsqueeze(1)
     tt = t.unsqueeze(0)  # [1,T]
     off = torch.as_tensor(note_off, device=t.device)
+    z, one = torch.zeros_like(s), torch.ones_like(s)
 
-    def seg(v0, v1, prog):  # curved interpolation v0 -> v1
+    def seg(v0, v1, prog, k):  # curved interpolation v0 -> v1
         return v1 + (v0 - v1) * torch.exp(-k * prog.clamp(0, 1))
 
-    attack = seg(torch.zeros_like(s), torch.ones_like(s), tt / a_t)        # 0 -> 1
-    decay = seg(torch.ones_like(s), s, (tt - a_t) / d_t)                    # 1 -> s
-    pre_off = torch.where(tt < a_t, attack, decay)                         # envelope while held
+    attack = seg(z, one, tt / a_t, curve_a)                                 # 0 -> 1
+    decay = seg(one, s, (tt - a_t) / d_t, curve_d)                          # 1 -> s
+    pre_off = torch.where(tt < a_t, attack, decay)                         # held
     held_at_off = torch.where(
         off < a_t,
-        seg(torch.zeros_like(s), torch.ones_like(s), off / a_t),
-        seg(torch.ones_like(s), s, (off - a_t) / d_t),
+        seg(z, one, off / a_t, curve_a),
+        seg(one, s, (off - a_t) / d_t, curve_d),
     )
-    release = seg(held_at_off, torch.zeros_like(s), (tt - off) / r_t)      # held -> 0
+    release = seg(held_at_off, z, (tt - off) / r_t, curve_r)               # held -> 0
     return torch.where(tt < off, pre_off, release).clamp(min=0.0)
+
+
+def _inv_sigmoid(v: float, ceil: float) -> float:
+    """Raw value whose sigmoid*ceil == v (to init a bounded learnable param)."""
+    x = min(max(v / ceil, 1e-4), 1 - 1e-4)
+    return math.log(x / (1 - x))
 
 
 class DiffOperator(nn.Module):
     """Renders [B, n_samples] mono audio from per-op FM controls (one algorithm)."""
 
+    # ceilings for the bounded learnable calibration (sigmoid * ceiling)
+    _CEIL = {"fm": 30.0, "a": 4.0, "d": 8.0, "r": 10.0, "curve": 12.0}
+
     def __init__(self, sample_rate: int = 16000, n_samples: int = 48000,
-                 note_off: float = 1.5, calib: CalibConstants | None = None):
+                 note_off: float = 1.5, calib: CalibConstants | None = None,
+                 oversample: int = 2, learn_calib: bool = True):
         super().__init__()
         self.sr = sample_rate
         self.n = n_samples
         self.note_off = note_off
-        self.cc = calib or CalibConstants()
+        self.os = max(1, oversample)
+        # time grids: base rate (legacy/external) + oversampled (rendering)
         self.register_buffer("t", torch.arange(n_samples).float() / sample_rate)
+        self.register_buffer("t_os", torch.arange(n_samples * self.os).float()
+                             / (sample_rate * self.os))
+        if self.os > 1:
+            self.register_buffer("aa_kernel", self._make_aa_kernel(self.os))
+
+        init = calib or CalibConstants()
+        c = self._CEIL
+        self.raw_fm = nn.Parameter(torch.tensor(_inv_sigmoid(init.fm_scale, c["fm"])))
+        self.raw_a = nn.Parameter(torch.tensor(_inv_sigmoid(init.max_attack, c["a"])))
+        self.raw_d = nn.Parameter(torch.tensor(_inv_sigmoid(init.max_decay, c["d"])))
+        self.raw_r = nn.Parameter(torch.tensor(_inv_sigmoid(init.max_release, c["r"])))
+        self.raw_ca = nn.Parameter(torch.tensor(_inv_sigmoid(init.env_curve, c["curve"])))
+        self.raw_cd = nn.Parameter(torch.tensor(_inv_sigmoid(init.env_curve, c["curve"])))
+        self.raw_cr = nn.Parameter(torch.tensor(_inv_sigmoid(init.env_curve, c["curve"])))
+        if not learn_calib:
+            for p in (self.raw_fm, self.raw_a, self.raw_d, self.raw_r,
+                      self.raw_ca, self.raw_cd, self.raw_cr):
+                p.requires_grad_(False)
+
+    # --- bounded learnable calibration (sigmoid * ceiling) --------------------
+    @property
+    def fm_scale(self):
+        return torch.sigmoid(self.raw_fm) * self._CEIL["fm"]
+
+    @property
+    def max_attack(self):
+        return torch.sigmoid(self.raw_a) * self._CEIL["a"]
+
+    @property
+    def max_decay(self):
+        return torch.sigmoid(self.raw_d) * self._CEIL["d"]
+
+    @property
+    def max_release(self):
+        return torch.sigmoid(self.raw_r) * self._CEIL["r"]
+
+    @property
+    def curves(self):
+        c = self._CEIL["curve"]
+        return (torch.sigmoid(self.raw_ca) * c, torch.sigmoid(self.raw_cd) * c,
+                torch.sigmoid(self.raw_cr) * c)
+
+    def _make_aa_kernel(self, os: int, zeros: int = 16) -> torch.Tensor:
+        """Hann-windowed sinc low-pass at the original Nyquist, for OS-rate decimation."""
+        K = 2 * zeros * os + 1
+        n = torch.arange(K).float() - (K - 1) / 2
+        fc = 0.5 / os  # cutoff in cycles/sample at the oversampled rate
+        kernel = 2 * fc * torch.sinc(2 * fc * n)
+        kernel = kernel * torch.hann_window(K, periodic=False)
+        kernel = kernel / kernel.sum()
+        return kernel.view(1, 1, K)
+
+    def _decimate(self, x: torch.Tensor) -> torch.Tensor:
+        """[B, n*os] -> [B, n] via anti-alias low-pass then subsample."""
+        if self.os == 1:
+            return x[:, :self.n]
+        pad = self.aa_kernel.shape[-1] // 2
+        x = F.conv1d(x.unsqueeze(1), self.aa_kernel, padding=pad).squeeze(1)
+        return x[:, ::self.os][:, :self.n]
 
     def render(
         self,
@@ -116,31 +194,42 @@ class DiffOperator(nn.Module):
         algo: int,              # algorithm index 0..10 (hard-selected)
         f0: float = 261.63,     # Ableton MIDI note 60 ("C3" label) = 261.6 Hz
         volume: torch.Tensor | None = None,  # [B] in [0,1]
-        calib: CalibConstants | None = None,  # learnable constants (defaults to self.cc)
+        calib: CalibConstants | None = None,  # fixed override (legacy); else learned params
     ) -> torch.Tensor:
-        cc = calib if calib is not None else self.cc
         B = coarse.shape[0]
+        t = self.t_os                       # render at the oversampled rate
+        if calib is not None:               # legacy fixed-constant path
+            fm_scale = calib.fm_scale
+            max_a, max_d, max_r = calib.max_attack, calib.max_decay, calib.max_release
+            cv_a = cv_d = cv_r = calib.env_curve
+        else:                               # learned, bounded calibration
+            fm_scale = self.fm_scale
+            max_a, max_d, max_r = self.max_attack, self.max_decay, self.max_release
+            cv_a, cv_d, cv_r = self.curves
+
         edges = ALGORITHMS[algo]["edges"]
         carriers = ALGORITHMS[algo]["carriers"]
         order = _topo_order(edges)
 
         # base (unmodulated) phase per op: 2*pi*f0*coarse*t
-        phase_base = 2 * math.pi * f0 * coarse.unsqueeze(-1) * self.t.view(1, 1, -1)  # [B,4,T]
+        phase_base = 2 * math.pi * f0 * coarse.unsqueeze(-1) * t.view(1, 1, -1)  # [B,4,T*os]
         env = torch.stack(
             [adsr(adsr_params[:, i, 0], adsr_params[:, i, 1], adsr_params[:, i, 2],
-                  adsr_params[:, i, 3], self.t, self.note_off, cc) for i in range(N_OPS)],
+                  adsr_params[:, i, 3], t, self.note_off,
+                  max_a, max_d, max_r, cv_a, cv_d, cv_r) for i in range(N_OPS)],
             dim=1,
-        )  # [B,4,T]
+        )  # [B,4,T*os]
 
-        out = [None] * N_OPS  # each op's env-shaped unit oscillator
+        out = [None] * N_OPS  # each op's env-shaped oscillator
         mods_of = {c: [m for m, car in edges if car == c] for c in range(N_OPS)}
         for op in order:
-            mod = torch.zeros(B, self.n, device=coarse.device)
+            mod = torch.zeros(B, t.shape[0], device=coarse.device)
             for m in mods_of[op]:
-                mod = mod + cc.fm_scale * level[:, m].unsqueeze(-1) * out[m]
+                mod = mod + fm_scale * level[:, m].unsqueeze(-1) * out[m]
             out[op] = env[:, op] * torch.sin(phase_base[:, op] + mod)
 
         audio = sum(level[:, c].unsqueeze(-1) * out[c] for c in carriers)
+        audio = self._decimate(audio)       # anti-alias + back to base rate
         if volume is not None:
             audio = audio * volume.unsqueeze(-1)
         # normalize headroom (avoid clipping; relative timbre is what matters)
@@ -164,3 +253,6 @@ if __name__ == "__main__":
     print("audio", tuple(audio.shape), "peak", float(audio.abs().max()),
           "rms", float(audio.pow(2).mean().sqrt()))
     print("grad to level:", level.grad is not None and bool(level.grad.abs().sum() > 0))
+    print("grad to fm_scale:", bool(synth.raw_fm.grad is not None and synth.raw_fm.grad.abs() > 0))
+    print("calib:", f"fm={float(synth.fm_scale):.2f} a={float(synth.max_attack):.2f} "
+          f"d={float(synth.max_decay):.2f} r={float(synth.max_release):.2f}")

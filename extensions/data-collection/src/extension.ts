@@ -33,6 +33,8 @@ import {
   BATCH_TIMEOUT_MS,
   STOP_FILE,
   PREDICT_MANIFEST,
+  SWEEPS_DIR,
+  SEARCH_DIR,
 } from "./config.js";
 import { buildRack, findOperatorTracks, randomizeAll, applyParams } from "./operator.js";
 import { nextBatchId, writeManifest } from "./batch.js";
@@ -47,6 +49,103 @@ export function activate(activation: ActivationContext) {
   register(context, "doppelganger.randomizeBatch", "doppelganger: Randomize Batch", runRandomizeBatch);
   register(context, "doppelganger.autoCollect", "doppelganger: Auto Collect", runAutoCollect);
   register(context, "doppelganger.applyPredicted", "doppelganger: Apply Predicted Batch", runApplyPredicted);
+  register(context, "doppelganger.runSweeps", "doppelganger: Run Sweeps", runSweeps);
+  register(context, "doppelganger.runSearch", "doppelganger: Run Search", runSearch);
+}
+
+/**
+ * In-the-loop CMA-ES handshake: the Python search driver writes a population to
+ * SEARCH_DIR/manifest.json and bumps SEARCH_DIR/gen.txt; this applies that
+ * population to the rack and echoes the generation to applied.txt. Python then
+ * exports + scores + proposes the next generation. Runs until STOP appears.
+ */
+async function runSearch(context: Ctx): Promise<void> {
+  const tracks = findOperatorTracks(context);
+  if (tracks.length === 0) {
+    await report(context, ['No rack found. Run "Build Operator Rack" first.']);
+    return;
+  }
+  const genFile = path.join(SEARCH_DIR, "gen.txt");
+  const appliedFile = path.join(SEARCH_DIR, "applied.txt");
+  const manifestFile = path.join(SEARCH_DIR, "manifest.json");
+  const stopFile = path.join(SEARCH_DIR, "STOP");
+
+  const readInt = async (p: string): Promise<number> => {
+    try {
+      return parseInt(await fs.readFile(p, "utf8"), 10);
+    } catch {
+      return -1;
+    }
+  };
+
+  console.log("[doppelganger] search loop started");
+  let lastApplied = -1;
+  let idleMs = 0;
+  let generations = 0;
+  while (idleMs < BATCH_TIMEOUT_MS) {
+    if (await fileExists(stopFile)) break;
+    const gen = await readInt(genFile);
+    if (gen > lastApplied && (await fileExists(manifestFile))) {
+      const manifest = JSON.parse(await fs.readFile(manifestFile, "utf8"));
+      await applyParams(context, tracks, manifest.tracks);
+      await fs.writeFile(appliedFile, String(gen), "utf8");
+      lastApplied = gen;
+      generations++;
+      idleMs = 0;
+    } else {
+      await delay(200);
+      idleMs += 200;
+    }
+  }
+  await report(context, [`Search finished: applied ${generations} generation(s).`]);
+}
+
+/**
+ * Applies each designed-sweep manifest in dataset/sweeps/<exp>/ to the rack and
+ * hands off to the Python watcher to export (file handshake, like Auto Collect):
+ *   here: apply params -> write READY -> wait for DONE -> next sweep.
+ */
+async function runSweeps(context: Ctx): Promise<void> {
+  const song = context.application.song;
+  const tracks = findOperatorTracks(context);
+  if (!song || tracks.length === 0) {
+    await report(context, ['No rack found. Run "Build Operator Rack" first.']);
+    return;
+  }
+
+  let dirs: string[];
+  try {
+    const entries = await fs.readdir(SWEEPS_DIR, { withFileTypes: true });
+    dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  } catch {
+    await report(context, [
+      "No sweeps found. First run:",
+      "  uv run python -m doppelganger.synth.run_sweeps",
+    ]);
+    return;
+  }
+
+  let done = 0;
+  let reason = `applied all ${dirs.length} sweep(s)`;
+  for (const name of dirs) {
+    const dir = path.join(SWEEPS_DIR, name);
+    const manifestPath = path.join(dir, "manifest.json");
+    if (!(await fileExists(manifestPath))) continue;
+    if (await fileExists(path.join(dir, "DONE"))) {
+      done++;
+      continue; // already exported in a previous run
+    }
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    const applied = await applyParams(context, tracks, manifest.tracks);
+    console.log(`[doppelganger] sweep ${name}: applied ${applied} tracks — waiting for export…`);
+    await fs.writeFile(path.join(dir, "READY"), "", "utf8");
+    if (!(await waitForFile(path.join(dir, "DONE"), BATCH_TIMEOUT_MS))) {
+      reason = `timed out on ${name} (is the run_sweeps watcher running?)`;
+      break;
+    }
+    done++;
+  }
+  await report(context, [`Sweeps: ${done}/${dirs.length} exported.`, `(${reason})`]);
 }
 
 /** "Hear it" eval: apply model-predicted params from the predict manifest to the rack. */

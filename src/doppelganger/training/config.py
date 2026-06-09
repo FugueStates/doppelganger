@@ -8,7 +8,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class AudioConfig:
     sample_rate: int = 16000
-    clip_seconds: float = 2.0
+    clip_seconds: float = 3.0  # capture note + release tail (matches the 3 s render)
     n_fft: int = 1024
     hop: int = 256
     n_mels: int = 128

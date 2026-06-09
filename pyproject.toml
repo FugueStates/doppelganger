@@ -20,6 +20,7 @@ train = [
     "torch>=2.2",
     "scipy>=1.11",
     "tensorboard>=2.16",
+    "cma>=3.3",
 ]
 
 # Train on CUDA (GPU). The exported ONNX model is device-agnostic and still runs on
@@ -27,9 +28,11 @@ train = [
 [tool.uv.sources]
 torch = { index = "pytorch-cuda" }
 
+# cu124 matches the 2x3090 (CUDA 12.4) box and still runs on the 4070 dev machine
+# (a cu128 wheel needs a ~CUDA-12.8 driver, which a 12.4 box does not have).
 [[tool.uv.index]]
 name = "pytorch-cuda"
-url = "https://download.pytorch.org/whl/cu128"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [build-system]

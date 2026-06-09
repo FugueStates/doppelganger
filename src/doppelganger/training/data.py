@@ -43,7 +43,9 @@ def _load_audio(path: Path, target_sr: int, n_samples: int) -> np.ndarray:
 
 
 class OperatorDataset(Dataset):
-    def __init__(self, root: str | Path, codec: ParamCodec, audio: AudioConfig):
+    def __init__(
+        self, root: str | Path, codec: ParamCodec, audio: AudioConfig, cache_audio: bool = True
+    ):
         self.root = Path(root)
         self.codec = codec
         self.audio = audio
@@ -51,15 +53,45 @@ class OperatorDataset(Dataset):
         self.ids = sorted(p.stem for p in wav_dir.glob("*.wav"))
         if not self.ids:
             raise RuntimeError(f"No wavs found under {wav_dir}")
+        # Decode + resample is the real bottleneck; cache the result in RAM so it
+        # happens once, not every epoch. (~20k * 2s @ 16k mono ≈ 2.5 GB.)
+        self.cache_audio = cache_audio
+        self._cache: dict[int, np.ndarray] = {}
 
     def __len__(self) -> int:
         return len(self.ids)
 
-    def __getitem__(self, i: int):
+    def precompute(self, workers: int = 8) -> None:
+        """Decode+resample all clips up front, in parallel threads (soundfile/scipy
+        release the GIL), so epoch 1 isn't single-threaded-slow."""
+        if not self.cache_audio:
+            return
+        from concurrent.futures import ThreadPoolExecutor
+
+        def load(i: int):
+            sid = self.ids[i]
+            return i, _load_audio(
+                self.root / "wav" / f"{sid}.wav", self.audio.sample_rate, self.audio.n_samples
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for i, a in ex.map(load, range(len(self.ids))):
+                self._cache[i] = a
+
+    def _audio(self, i: int) -> np.ndarray:
+        if self.cache_audio and i in self._cache:
+            return self._cache[i]
         sid = self.ids[i]
-        audio = _load_audio(
+        a = _load_audio(
             self.root / "wav" / f"{sid}.wav", self.audio.sample_rate, self.audio.n_samples
         )
+        if self.cache_audio:
+            self._cache[i] = a
+        return a
+
+    def __getitem__(self, i: int):
+        sid = self.ids[i]
+        audio = self._audio(i)
         params = json.loads(
             (self.root / "params" / f"{sid}.json").read_text(encoding="utf-8")
         )["params"]
@@ -69,4 +101,7 @@ class OperatorDataset(Dataset):
             "cont": torch.from_numpy(t.cont),
             "binary": torch.from_numpy(t.binary),
             "cat": torch.from_numpy(t.cat),
+            "cont_mask": torch.from_numpy(t.cont_mask),
+            "binary_mask": torch.from_numpy(t.binary_mask),
+            "cat_mask": torch.from_numpy(t.cat_mask),
         }

@@ -17,13 +17,17 @@ export const TRACK_PREFIX = "op_";
 /** How many Operator tracks the rack contains (= samples per export). */
 export const NUM_TRACKS = 64;
 
-/** The MIDI note every track plays (fixed for v1, like the sound-matching literature). */
+/** The MIDI note every track plays (fixed C3 for now; pitch/velocity variation is a
+ *  later enrichment that also needs inference-side pitch handling). */
 export const NOTE_PITCH = 60; // C3 in Live's convention
 export const NOTE_VELOCITY = 100;
-export const NOTE_BEATS = 4; // note length in beats (2.0 s @ 120 BPM)
+/** Note length: SHORT relative to the render so the release tail is captured.
+ *  3 beats = 1.5 s note, then note-off + release within a 3 s render. Without this
+ *  the held note filled the whole render and decay/release params were unhearable. */
+export const NOTE_BEATS = 3;
 
-/** Suggested export length — set this as your export selection/loop in Live. */
-export const RENDER_SECONDS = 3.0; // note (2 s) + ~1 s release tail
+/** Export length — set this as your export selection/loop in Live (note + release tail). */
+export const RENDER_SECONDS = 3.0;
 
 /**
  * Sampling rules — the fix for "random params = silence".
@@ -91,3 +95,9 @@ export const STOP_FILE = `${REPO_ROOT}/dataset/STOP`;
 
 /** Manifest of model-predicted params to apply for the "hear it" evaluation. */
 export const PREDICT_MANIFEST = `${REPO_ROOT}/dataset/predict/manifest.json`;
+
+/** Root of the designed-sweep folders (each subdir has a manifest.json). */
+export const SWEEPS_DIR = `${REPO_ROOT}/dataset/sweeps`;
+
+/** In-the-loop CMA-ES search handshake directory. */
+export const SEARCH_DIR = `${REPO_ROOT}/dataset/search`;

@@ -14,6 +14,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset, random_split
 from torch.utils.tensorboard import SummaryWriter
 
@@ -22,6 +23,7 @@ from .codec import ParamCodec
 from .config import AudioConfig
 from .data import OperatorDataset
 from .model import SoundMatcher, compute_loss
+from .proxy import MelEmbedding, SynthProxy
 
 
 def _repo_root() -> Path:
@@ -30,26 +32,33 @@ def _repo_root() -> Path:
 
 @torch.no_grad()
 def evaluate(model: SoundMatcher, loader: DataLoader, device: str) -> dict:
+    """Metrics over ACTIVE (unmasked) params only — i.e. params that are audible in
+    each preset. This is the fair measure of what the model can actually learn."""
     model.eval()
-    n = 0
-    cont_mae = bin_correct = bin_total = 0.0
-    cat_correct = cat_total = 0.0
+    cont_err = cont_n = 0.0
+    bin_correct = bin_n = 0.0
+    cat_correct = cat_n = 0.0
     for batch in loader:
         batch = {k: v.to(device) for k, v in batch.items()}
         out = model(batch["audio"])
-        bs = batch["audio"].shape[0]
-        n += bs
-        cont_mae += (model.cont_values(out) - batch["cont"]).abs().mean().item() * bs
+
+        cm = batch["cont_mask"]
+        cont_err += ((model.cont_values(out) - batch["cont"]).abs() * cm).sum().item()
+        cont_n += cm.sum().item()
+
+        bm = batch["binary_mask"]
         bin_pred = (out["binary_logits"] > 0).float()
-        bin_correct += (bin_pred == batch["binary"]).float().sum().item()
-        bin_total += batch["binary"].numel()
+        bin_correct += ((bin_pred == batch["binary"]).float() * bm).sum().item()
+        bin_n += bm.sum().item()
+
         for i, logits in enumerate(out["cat_logits"]):
-            cat_correct += (logits.argmax(1) == batch["cat"][:, i]).sum().item()
-            cat_total += bs
+            correct = (logits.argmax(1) == batch["cat"][:, i]).float() * batch["cat_mask"][:, i]
+            cat_correct += correct.sum().item()
+            cat_n += batch["cat_mask"][:, i].sum().item()
     return {
-        "cont_mae": cont_mae / n,
-        "binary_acc": bin_correct / max(bin_total, 1),
-        "cat_acc": cat_correct / max(cat_total, 1),
+        "cont_mae": cont_err / max(cont_n, 1),
+        "binary_acc": bin_correct / max(bin_n, 1),
+        "cat_acc": cat_correct / max(cat_n, 1),
     }
 
 
@@ -66,14 +75,19 @@ def main() -> None:
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--run-name", default="operator", help="TensorBoard run subfolder")
+    ap.add_argument("--proxy", default=None, help="path to a trained proxy.pt -> adds perceptual loss")
+    ap.add_argument("--perceptual-weight", type=float, default=1.0)
     args = ap.parse_args()
 
     audio = AudioConfig()
     schema = OperatorSchema.load(args.schema)
     codec = ParamCodec(schema)
     print(schema.summary(), "| device:", args.device)
+    torch.backends.cudnn.benchmark = True  # autotune convs for our fixed input size
 
     full = OperatorDataset(args.data, codec, audio)
+    print(f"caching {len(full)} clips in RAM…")
+    full.precompute()
     if args.overfit:
         train_ds = val_ds = Subset(full, list(range(min(args.overfit, len(full)))))
         print(f"OVERFIT mode on {len(train_ds)} samples")
@@ -84,8 +98,11 @@ def main() -> None:
         )
         print(f"train={len(train_ds)} val={len(val_ds)}")
 
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers)
-    val_dl = DataLoader(val_ds, batch_size=args.batch_size, num_workers=args.workers)
+    pin = args.device == "cuda"
+    train_dl = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=pin
+    )
+    val_dl = DataLoader(val_ds, batch_size=args.batch_size, num_workers=args.workers, pin_memory=pin)
     # A fixed slice of train, evaluated each epoch, to watch the train-vs-val gap live.
     train_eval_dl = DataLoader(
         Subset(train_ds, list(range(min(512, len(train_ds))))), batch_size=args.batch_size
@@ -98,9 +115,20 @@ def main() -> None:
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
+    # Optional perceptual loss via a frozen neural proxy (params -> audio embedding).
+    proxy = mel_embed = None
+    if args.proxy:
+        pck = torch.load(args.proxy, map_location=args.device, weights_only=False)
+        proxy = SynthProxy(pck["n_cont"], pck["n_binary"], pck["cat_cardinalities"], pck["embed_dim"]).to(args.device)
+        proxy.load_state_dict(pck["state_dict"])
+        proxy.eval()
+        for p in proxy.parameters():
+            p.requires_grad_(False)
+        mel_embed = MelEmbedding(audio).to(args.device).eval()
+        print(f"perceptual loss ON via proxy (weight={args.perceptual_weight})")
+
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    best = float("inf")
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -109,6 +137,11 @@ def main() -> None:
             batch = {k: v.to(args.device) for k, v in batch.items()}
             out = model(batch["audio"])
             loss, parts = compute_loss(out, batch, model.n_bins)
+            if proxy is not None:
+                with torch.no_grad():
+                    target_emb = mel_embed(batch["audio"])
+                perc = F.l1_loss(proxy(model.soft_param_vector(out)), target_emb)
+                loss = loss + args.perceptual_weight * perc
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -123,6 +156,7 @@ def main() -> None:
         for k in ("cont_mae", "binary_acc", "cat_acc"):
             writer.add_scalar(f"val/{k}", val_m[k], epoch)
             writer.add_scalar(f"train/{k}", tr_m[k], epoch)
+        writer.flush()  # show up in TensorBoard immediately (default flushes every 120s)
 
         print(
             f"epoch {epoch:3} loss={avg:.4f} | "
@@ -131,23 +165,24 @@ def main() -> None:
             f"cat_acc={val_m['cat_acc']:.3f}"
         )
 
-        metrics = val_m
-        score = metrics["cont_mae"]
-        if score < best:
-            best = score
-            torch.save(
-                {
-                    "state_dict": model.state_dict(),
-                    "n_cont": codec.n_cont,
-                    "n_binary": codec.n_binary,
-                    "cat_cardinalities": codec.cat_cardinalities,
-                    "n_bins": model.n_bins,
-                    "audio": asdict(audio),
-                },
-                out_dir / "model.pt",
-            )
+        # Save the latest checkpoint every epoch. We do NOT select by val param
+        # metrics — they're flat (many-to-one), so "best val" picks an undertrained
+        # epoch. The meaningful selector is the audio metric (hear_it), measured
+        # separately; here we just keep the most-trained weights.
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "n_cont": codec.n_cont,
+                "n_binary": codec.n_binary,
+                "cat_cardinalities": codec.cat_cardinalities,
+                "n_bins": model.n_bins,
+                "audio": asdict(audio),
+                "epoch": epoch,
+            },
+            out_dir / "model.pt",
+        )
     writer.close()
-    print(f"Done. Best val cont_mae={best:.4f}. Saved to {out_dir / 'model.pt'}")
+    print(f"Done ({args.epochs} epochs). Saved final checkpoint to {out_dir / 'model.pt'}")
 
 
 if __name__ == "__main__":

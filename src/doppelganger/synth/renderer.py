@@ -55,10 +55,23 @@ class RendererConfig:
         return tuple(n // 4 for n in self.n_ffts)
 
 
+_WIN_CACHE: dict = {}
+
+
+def _hann(n_fft: int, device) -> torch.Tensor:
+    """Cached Hann window — avoids reallocating it on every STFT (6x per training step)."""
+    key = (n_fft, str(device))
+    w = _WIN_CACHE.get(key)
+    if w is None:
+        w = torch.hann_window(n_fft, device=device)
+        _WIN_CACHE[key] = w
+    return w
+
+
 def log_mag(wave: torch.Tensor, n_fft: int, hop: int, eps: float = 1e-5) -> torch.Tensor:
     """[B, T] waveform -> [B, F, frames] log-magnitude linear STFT."""
-    win = torch.hann_window(n_fft, device=wave.device)
-    spec = torch.stft(wave, n_fft=n_fft, hop_length=hop, window=win, center=True, return_complex=True)
+    spec = torch.stft(wave, n_fft=n_fft, hop_length=hop, window=_hann(n_fft, wave.device),
+                      center=True, return_complex=True)
     return torch.log(spec.abs() + eps)
 
 

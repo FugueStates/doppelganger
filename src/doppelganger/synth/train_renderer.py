@@ -113,14 +113,16 @@ def mean_spectrogram(model, loader, device, canon: int):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, mean_spec, canon: int):
+def evaluate(model, loader, device, mean_spec, canon: int, max_samples: int = 0):
     """At the canonical resolution: plain L1 (hyb/phys/mean) for log continuity, plus the
     energy-weighted L1 for hybrid and mean — the latter gates the renderer (the matcher
-    needs the loud bins right; hyb_e must drop clearly below mean_e)."""
+    needs the loud bins right; hyb_e must drop clearly below mean_e). max_samples>0 caps it."""
     model.eval()
     hyb = phys = mean = n = 0.0
     e_num_h = e_num_m = e_den = 0.0
     for dicts, waves in loader:
+        if max_samples and n >= max_samples:
+            break
         t = model.target_logmag(waves.to(device))[canon]
         ph = model(dicts, device, apply_residual=True)[canon]
         pp = model(dicts, device, apply_residual=False)[canon]
@@ -153,12 +155,19 @@ def _parse_args():
     ap.add_argument("--limit", type=int, default=0, help="cap dataset size (0 = all) for quick dev runs")
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
+    ap.add_argument("--clip", type=float, default=1.0, help="grad-norm clip (0 = off); stabilizes bf16 + Transformer")
+    ap.add_argument("--warmup-epochs", type=int, default=5, help="linear LR warmup before cosine (Transformers need it)")
     ap.add_argument("--alpha", type=float, default=10.0, help="loud-bin emphasis in the loss")
     ap.add_argument("--encoder", choices=["transformer", "mlp"], default=None,
                     help="conditioning encoder (default: RendererConfig's 'transformer'); 'mlp' for ablation")
     ap.add_argument("--oversample", type=int, default=None, help="physics anti-alias factor (override cfg; 1 = off)")
     ap.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True,
                     help="bf16 mixed precision on CUDA (--no-amp to disable)")
+    ap.add_argument("--grad-ckpt", action=argparse.BooleanOptionalAction, default=True,
+                    help="gradient checkpointing (saves VRAM; --no-grad-ckpt is faster if it fits)")
+    ap.add_argument("--compile", action="store_true", help="torch.compile the model (experimental)")
+    ap.add_argument("--eval-every", type=int, default=2, help="run validation every N epochs")
+    ap.add_argument("--eval-samples", type=int, default=0, help="cap val samples per eval (0 = full)")
     ap.add_argument("--ema-decay", type=float, default=0.999)
     ap.add_argument("--patience", type=int, default=10, help="early-stop after N epochs without val gain")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -192,6 +201,7 @@ def worker(rank: int, world_size: int, args):
         cfg = dataclasses.replace(cfg, encoder=args.encoder)
     if args.oversample is not None:
         cfg = dataclasses.replace(cfg, oversample=args.oversample)
+    cfg = dataclasses.replace(cfg, grad_checkpoint=args.grad_ckpt)
     canon = cfg.canon_fft
     schema = OperatorSchema.load(root / "schemas" / "operator.json")
     ds = RendererDataset(Path(args.data), cfg)
@@ -210,7 +220,15 @@ def worker(rank: int, world_size: int, args):
 
     model = HybridRenderer(schema, cfg).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    warmup = max(0, min(args.warmup_epochs, args.epochs - 1))
+    if warmup:  # linear warmup -> cosine: the Transformer encoder diverges without it
+        sched = torch.optim.lr_scheduler.SequentialLR(
+            opt,
+            [torch.optim.lr_scheduler.LinearLR(opt, start_factor=0.01, total_iters=warmup),
+             torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs - warmup)],
+            milestones=[warmup])
+    else:
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     out = Path(args.out) if args.out else root / "models" / "operator" / "renderer.pt"
 
     start_epoch, best_val, since_best = 1, float("inf"), 0
@@ -227,6 +245,8 @@ def worker(rank: int, world_size: int, args):
 
     # DDP wraps AFTER any resume-load; its constructor broadcasts rank-0 weights to all ranks.
     net = DDP(model, device_ids=[rank]) if distributed else model
+    if args.compile:  # experimental: fuses the residual/encoder; eval still uses uncompiled `model`
+        net = torch.compile(net)
 
     # EMA + the predict-the-mean baseline + eval all live on rank 0 only.
     ema = mean_spec = va_dl = None
@@ -261,16 +281,23 @@ def worker(rank: int, world_size: int, args):
             if bad.item() > 0:
                 opt.zero_grad(set_to_none=True)
                 continue
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad(); loss.backward()
+            if args.clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+            opt.step()
             if is_main:
                 ema.update(model)
             run += loss.item(); nb += 1
         sched.step()
 
+        # eval only every N epochs (always on the last) — eval is single-GPU and idles the
+        # other rank, so this is a real wall-clock win
+        do_eval = is_main and (epoch % args.eval_every == 0 or epoch == args.epochs)
         stop = torch.zeros(1, device=device)
-        if is_main:
+        if do_eval:
             with ema_weights(model, ema):  # evaluate (and deploy) the averaged weights
-                hyb, phys, mean, hyb_e, mean_e = evaluate(model, va_dl, device, mean_spec, canon)
+                hyb, phys, mean, hyb_e, mean_e = evaluate(
+                    model, va_dl, device, mean_spec, canon, args.eval_samples)
             improved = hyb_e < best_val - 1e-4  # select on the energy-weighted (loud-bin) metric
             print(f"epoch {epoch:3} train={run/max(nb,1):.4f} | L1 hyb={hyb:.4f} phys={phys:.4f} "
                   f"mean={mean:.4f} | energy-wt hyb={hyb_e:.4f} mean={mean_e:.4f}"
@@ -287,8 +314,10 @@ def worker(rank: int, world_size: int, args):
             else:
                 since_best += 1
                 if since_best >= args.patience:
-                    print(f"Early stop: no val gain for {args.patience} epochs.")
+                    print(f"Early stop: no val gain for {args.patience} eval(s).")
                     stop[0] = 1.0
+        elif is_main:
+            print(f"epoch {epoch:3} train={run/max(nb,1):.4f} | (no eval; every {args.eval_every})")
         if distributed:  # all ranks must learn rank-0's early-stop decision in lockstep
             dist.broadcast(stop, src=0)
         if stop.item() > 0:

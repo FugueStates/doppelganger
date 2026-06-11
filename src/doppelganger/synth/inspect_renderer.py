@@ -19,6 +19,7 @@ Reports, for hybrid / physics-only / predict-mean:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from pathlib import Path
 
 import torch
@@ -59,15 +60,19 @@ def main():
     ap.add_argument("--device", default="cpu")
     args = ap.parse_args()
 
-    cfg = RendererConfig()
     schema = OperatorSchema.load(root / "schemas" / "operator.json")
+    ck = torch.load(args.ckpt, map_location=args.device, weights_only=False)
+    # rebuild the EXACT config the checkpoint was trained with (encoder, oversample, ch, ...),
+    # not the current defaults — else the architecture won't match the saved weights.
+    fields = {f.name for f in dataclasses.fields(RendererConfig)}
+    cfg = RendererConfig(**{k: v for k, v in ck.get("cfg", {}).items() if k in fields})
+
     ds = RendererDataset(Path(args.data), cfg)
     n_val = max(1, int(0.1 * len(ds)))
     _, va = random_split(ds, [len(ds) - n_val, n_val], generator=torch.Generator().manual_seed(0))
     va_dl = DataLoader(va, batch_size=16, collate_fn=collate)
 
     model = HybridRenderer(schema, cfg).to(args.device)
-    ck = torch.load(args.ckpt, map_location=args.device, weights_only=False)
     model.load_state_dict(ck["state_dict"])  # EMA weights (what we deploy)
     model.eval()
     canon = ck.get("canon_fft", cfg.canon_fft)

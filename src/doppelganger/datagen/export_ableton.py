@@ -29,7 +29,8 @@ from pathlib import Path
 
 try:
     import win32clipboard
-    from pywinauto import Desktop
+    import win32gui
+    from pywinauto import Application, Desktop
     from pywinauto.keyboard import send_keys
 except ImportError:  # pragma: no cover
     print("pywinauto not installed. Run: uv sync --extra datagen", file=sys.stderr)
@@ -55,10 +56,25 @@ def _desktop() -> "Desktop":
 
 
 def find_live():
-    """Return the top-level Ableton Live window (raises if not found)."""
-    win = _desktop().window(title_re=LIVE_TITLE_RE)
-    win.wait("exists", timeout=10)
-    return win
+    """Return the top-level Ableton Live window (raises if not found).
+
+    Looks the window up with raw win32 EnumWindows (instant), NOT a UIA title_re scan:
+    UIA inspects every top-level window out-of-process, and with hundreds of windows
+    open that scan can take MINUTES — the export then looks "hung" before a single
+    keystroke is ever sent. The returned win32 wrapper's set_focus() and the keystroke
+    sequence that follows are unchanged."""
+    matches: list[int] = []
+
+    def _cb(h, _):
+        if win32gui.IsWindowVisible(h) and "Ableton Live" in win32gui.GetWindowText(h):
+            matches.append(h)
+        return True
+
+    win32gui.EnumWindows(_cb, None)
+    if not matches:
+        raise RuntimeError("Ableton Live window not found — is Live running?")
+    app = Application(backend="win32").connect(handle=matches[0])
+    return app.window(handle=matches[0])
 
 
 def list_windows() -> None:
@@ -104,26 +120,26 @@ def export_batch(
     prefix = batch_dir.name
     save_target = str(batch_dir / prefix)  # Live appends " <track>.wav"
 
-    print(f"Export target: {save_target}")
+    print(f"Export target: {save_target}", flush=True)
     live = find_live()
     live.set_focus()
     time.sleep(settle)
 
     # 1) Open Live's Export dialog. It is custom-drawn INSIDE Live (not a native
     #    window), so pywinauto can't click its controls — we drive it by keyboard.
-    print("  Ctrl+Shift+R (open Export dialog)…")
+    print("  Ctrl+Shift+R (open Export dialog)…", flush=True)
     send_keys("^+r")
     time.sleep(export_dialog_wait)
 
     # 2) Press Enter to trigger the default "Export" button -> native Save dialog.
-    print("  Enter (trigger Export)…")
+    print("  Enter (trigger Export)…", flush=True)
     send_keys("{ENTER}")
     time.sleep(save_dialog_wait)  # let the Save dialog appear (filename field focused)
 
     # 3) Drive the Save dialog by keyboard only (pywinauto can't reliably *find* it):
     #    select the current filename, paste our full path, confirm. Pasting a full
     #    absolute path redirects the dialog to our folder + prefix.
-    print("  pasting path + Enter…")
+    print("  pasting path + Enter…", flush=True)
     _set_clipboard(save_target)
     send_keys("^a")  # select existing filename
     time.sleep(0.3)
@@ -146,7 +162,7 @@ def _wait_for_files(
         wavs = list(batch_dir.glob(f"{prefix}*.wav"))
         n = len(wavs)
         if n != last:
-            print(f"  …{n} file(s) so far")
+            print(f"  …{n} file(s) so far", flush=True)
             last = n
         if expected_count is not None and n >= expected_count:
             time.sleep(1.0)  # let the last file finish writing

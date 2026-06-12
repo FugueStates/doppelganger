@@ -59,6 +59,9 @@ def main() -> None:
     sweeps_dir = root / "dataset" / "sweeps"
     sweeps = []
     for d in sorted(p for p in sweeps_dir.iterdir() if (p / "manifest.json").exists()):
+        meta = json.loads((d / "manifest.json").read_text(encoding="utf-8"))
+        if meta.get("kind") == "freq_map":
+            continue  # frequency-mapping sweeps (freq_map.py) are not calibration data
         ctrl, real, algo = load_sweep(d, device)
         sweeps.append((d.name, ctrl, real, algo))
         print(f"loaded {d.name}: {real.shape[0]} clips, algo {algo + 1}")

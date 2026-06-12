@@ -53,8 +53,8 @@ doppelganger/
     schema.py  audio.py
     datagen/   split_export.py  export_ableton.py  run_loop.py
     synth/     renderer.py train_renderer.py inspect_renderer.py   ← CURRENT (audio-objective)
-               diff_operator.py spectral.py adapter.py sensitivity.py
-               search.py sweeps.py run_sweeps.py calibrate.py
+               diff_operator.py spectral.py adapter.py precompute.py
+               freq_map.py sensitivity.py search.py sweeps.py run_sweeps.py calibrate.py
     training/  (DEPRECATED param-regression: config/features/codec/data/model/train/eval/…)
   dataset/operator/{wav,params}/       generated dataset (gitignored; params JSON now also
                                        records `note` + `velocity` per sample)
@@ -167,14 +167,29 @@ go/no-go for building the diffusion matcher on top.
 cd D:\AbletonExtensions\doppelganger
 uv sync --extra train        # PyTorch (cu124) + scipy + tensorboard
 
+# (recommended) pack the v2 training cache: fp16 audio memmap + normalized param matrix
+# + notes/velocities — skips per-epoch WAV/JSON reads AND the per-step Python param
+# loops; one copy shared across DDP ranks. RERUN after adding data (training falls back
+# to live loading + warns if the cache is stale).
+uv run python -m doppelganger.synth.precompute
+
 # train; checkpoint -> models/operator/renderer.pt (EMA weights). AUTO-USES ALL GPUs (DDP):
 #   2x3090 box -> one process per GPU over NVLink automatically, no extra flags.
+# Pitch/velocity-conditioned by default (Batch 5): the physics renders at each sample's
+# recorded note (+Transpose) and the encoder gets note+velocity tokens.
 uv run python -m doppelganger.synth.train_renderer --epochs 80
 
 #   single GPU / CPU is the same command (falls through to one process).
 #   useful flags: --batch-size N (PER-GPU) --alpha 10 (loud-bin emphasis) --resume
 #                 --gpus 1 (force single) --limit 80 (tiny dev run) --out path.pt
+#                 --no-condition-pitch (legacy C3-only ablation; auto-filters to note=60)
 ```
+
+Train/val membership is a stable per-id hash (`crc32(id) % 10`), so adding data never
+reshuffles which samples are held out. The renderer's `forward` also accepts the
+normalized param matrix as a **tensor** (differentiable end-to-end into the physics) —
+this is the interface the diffusion matcher trains through. See
+[docs/batch5-refactor.md](docs/batch5-refactor.md) for the full change log + reasoning.
 
 **Validate fidelity** (the decisive metric — energy-weighted / top-10%-loud-bin log-mag L1
 vs a predict-the-mean baseline; runs single-process, fine on CPU):
@@ -182,6 +197,17 @@ vs a predict-the-mean baseline; runs single-process, fine on CPU):
 uv run python -m doppelganger.synth.inspect_renderer --n 512 --device cpu
 # look at "loud-bin gap closed vs mean" — higher = the renderer captures real sideband
 # structure (the gradient the matcher will ride on), not just the average sound.
+# Now reported per STFT resolution (2048 = sideband placement, 512 = envelope shape).
+```
+
+**Frequency-map verification** (measures how Operator's RAW param values map to real
+frequencies — Coarse ratio law, Fine semantics, Fixed-freq law, Quantize — so the
+physics prior encodes facts, not guesses):
+```powershell
+uv run python -m doppelganger.synth.freq_map gen        # writes manifests + watches/exports
+# then in Live: right-click -> "doppelganger: Collect Freq Maps"
+#   (pins every clip to each sweep's declared note first — required for measurement)
+uv run python -m doppelganger.synth.freq_map analyze    # tables + fits + verdicts
 ```
 
 Renderer/loss settings live in `synth/renderer.py` (`RendererConfig`: multi-res n_ffts,
@@ -212,12 +238,36 @@ run but are not part of the current workflow.
 
 ## Status
 
-- ✅ Tool 1 (data collection) — automated; ~47k C3 samples; collector now varies note+velocity.
-- 🔵 Tool 2 (neural renderer) — training on 2×3090 (DDP). Batch 1 (multi-res + frequency-
-  transport loss + EMA) validated (+42% loud-bin gap); Batch 2 (anti-aliased + self-
-  calibrating physics core) built. Next: Transformer encoder, then pitch conditioning.
-- ⬜ One-shot diffusion matcher — after renderer fidelity is locked.
+- ✅ Tool 1 (data collection) — automated; ~47k C3 samples; collector now varies note+velocity
+  (collecting ~50k pitch-diverse samples for Batch 5).
+- 🔵 Tool 2 (neural renderer) — training on 2×3090 (DDP, bf16). **Architecture locked** after a
+  batch-by-batch study on the loud-bin fidelity metric:
+  - Batch 1 (multi-res STFT + frequency-transport loss + EMA): **+42%** loud-bin gap ✅
+  - Batch 2 (anti-aliased + self-calibrating physics core): wash at C3 (residual isn't
+    prior-limited; anti-aliasing is latent insurance for high-pitch data)
+  - Batch 3 (**preset-tokenizer Transformer encoder**): **+50.1%** — the winning lever
+    (conditioning, not capacity: a matched MLP+capacity run was a wash at +41%) ✅ **locked**
+  - Efficiency: bf16 + TF32 + grad-checkpoint/LR-warmup/grad-clip + an fp16 memmap data cache
+    (`synth.precompute`).
+  - **Batch 5 refactor ✅ BUILT (2026-06-12,** see `docs/batch5-refactor.md`**):**
+    tensor-in differentiable forward (the matcher interface), pitch/velocity conditioning
+    (physics f0 from note+Transpose; encoder note/vel tokens), vectorized physics (one pass
+    for mixed algorithms), fp64 phase, cache v2 (normalized param matrix), stable hash
+    train/val split, pitch guard, per-resolution fidelity report. Smoke-tested end-to-end.
+  - **Freq-map sweeps ✅ MEASURED (2026-06-12)** — the real Operator's frequency laws,
+    now encoded in the physics prior: Coarse ratio = `max(floor(raw), 0.5)` (floor, not
+    round!), Fine is multiplicative `×(1 + fine/1000)`, Fixed mode is note-independent
+    `Hz = 10^(floor(mul)−3)·200^fixfreq` (exact exponential; floor confirmed by the
+    boundary sweep), Quantize is a no-op for the ratio. All ~0-cent residual — the
+    prior's frequency placement now matches the real device exactly.
+  - **Next:** retrain from scratch on the full pitch-diverse dataset (~50k new samples
+    being collected) and gate on `inspect_renderer`.
+- ⬜ One-shot diffusion matcher — after the pitch-conditioned renderer is faithful.
+  (Gradient path through the frozen renderer is now verified; remaining design decision:
+  how the matcher handles the discrete Algorithm/On-off params.)
 - ⬜ Tool 3 (inference extension) — not yet built.
+
+See `docs/PLAN.md` → **CURRENT PLAN (v3)** for the full phased roadmap.
 
 See [docs/PLAN.md](docs/PLAN.md) → **CURRENT PLAN (v3)** for the full roadmap (renderer
 Batches 1–5, the diffusion matcher, sim-to-real polish, pitch/velocity conditioning).

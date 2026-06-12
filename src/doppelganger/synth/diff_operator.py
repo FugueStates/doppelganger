@@ -6,17 +6,31 @@ Operator's FM topology (the *known physics* of phase-modulation synthesis). Insi
 HybridRenderer it is the gray-box PRIOR — it places the FM sidebands; the neural residual
 corrects the remainder. Final params are still applied to the REAL Operator.
 
-v2 (the physics is now a strong, self-calibrating prior):
+v3 (the Batch-5 refactor — see docs/batch5-refactor.md for the full old->new reasoning):
   • 4 sine operators (A,B,C,D), phase modulation, the 11 algorithm routings.
-  • Per-op ADSR with note-on/off and PER-SEGMENT learnable curvature (Operator's envelopes
-    are curved, and attack/decay/release curve differently — the clone's "secret sauce").
-  • ANTI-ALIASED rendering: oversample -> windowed-sinc low-pass -> decimate, so high
-    modulation-index / high-ratio sidebands above Nyquist don't fold back to wrong bins
-    (which the residual cannot easily undo — aliased energy looks like real content).
+  • FULLY VECTORIZED across algorithms: every routing edge goes (higher idx -> lower idx),
+    so D,C,B,A is a valid topological order for ALL 11 algorithms — one batched pass with
+    per-sample adjacency masks replaced the old per-algorithm Python grouping (which split
+    a batch of 16 into ~10 tiny sub-batches and throttled the GPU on kernel-launch
+    overhead). This also unblocks torch.compile (no data-dependent Python control flow)
+    and pays again in Phase B, where the matcher renders changing params every step.
+  • PER-SAMPLE f0: `f0` may be a [B] tensor (pitch conditioning, Batch 5) or a float
+    (legacy single-pitch calibrate/search paths).
+  • fp64 PHASE: at 3 s × ~12 kHz the phase reaches ~2.4e5 rad where fp32 spacing is
+    ~0.03 rad — audible broadband noise in the prior's tail. Phase *cycles* are computed
+    in fp64, wrapped with remainder(·,1), then cast to fp32 (elementwise fp64 is
+    bandwidth-bound — negligible cost, even on a 3090's weak fp64 units).
+  • Per-op ADSR with note-on/off and PER-SEGMENT learnable curvature.
+  • ANTI-ALIASED rendering: oversample -> windowed-sinc low-pass -> decimate. The
+    decimating conv now uses stride=os (computes only the kept samples — 2x cheaper,
+    bit-identical to the old full-conv-then-slice).
   • BOUNDED LEARNABLE calibration (fm depth, envelope times + curvature): trained jointly
-    with the residual via the spectral loss, so the prior calibrates itself. Bounded
-    (sigmoid x ceiling) to avoid the degeneracy a free least-squares fit showed.
-  Still not modeled: non-sine waveforms, filter, LFO, self-feedback, pitch/velocity.
+    with the residual via the spectral loss. Bounded (sigmoid x ceiling) to avoid the
+    degeneracy a free least-squares fit showed.
+  • `volume` was REMOVED: it was applied before peak-normalization, which cancels a
+    global scale exactly — output and gradient were identically unaffected (a dead knob).
+  Still not modeled: non-sine waveforms, filter, LFO, self-feedback, fixed-frequency
+  oscillators and Fine detune (pending the freq_map verification sweeps), velocity.
 
 Operators are indexed 0=A,1=B,2=C,3=D. Edges are (modulator -> carrier).
 """
@@ -47,19 +61,24 @@ ALGORITHMS: list[dict] = [
 ]
 N_OPS = 4
 
+# The vectorization invariant: every modulator index > its carrier index, so computing
+# ops in the fixed order D(3) -> C(2) -> B(1) -> A(0) is a valid topological order for
+# EVERY algorithm. Verified at import so a future routing edit can't silently break it.
+assert all(m > c for a in ALGORITHMS for m, c in a["edges"]), \
+    "ALGORITHMS invariant broken: an edge modulates upward — fixed-order rendering invalid"
 
-def _topo_order(edges: list[tuple[int, int]]) -> list[int]:
-    """Order ops so every modulator is computed before the carriers it feeds."""
-    order: list[int] = []
-    remaining = set(range(N_OPS))
-    while remaining:
-        for op in sorted(remaining):
-            # ready if no remaining op modulates `op` (its modulator inputs are done)
-            if not any(mod in remaining and car == op for mod, car in edges):
-                order.append(op)
-                remaining.discard(op)
-                break
-    return order
+
+def _routing_tensors() -> tuple[torch.Tensor, torch.Tensor]:
+    """ALGORITHMS table -> (adj [11,4,4], carriers [11,4]) mask tensors.
+    adj[a, m, c] = 1 if op m modulates op c under algorithm a."""
+    adj = torch.zeros(len(ALGORITHMS), N_OPS, N_OPS)
+    car = torch.zeros(len(ALGORITHMS), N_OPS)
+    for a, spec in enumerate(ALGORITHMS):
+        for m, c in spec["edges"]:
+            adj[a, m, c] = 1.0
+        for c in spec["carriers"]:
+            car[a, c] = 1.0
+    return adj, car
 
 
 @dataclass
@@ -111,7 +130,8 @@ def _inv_sigmoid(v: float, ceil: float) -> float:
 
 
 class DiffOperator(nn.Module):
-    """Renders [B, n_samples] mono audio from per-op FM controls (one algorithm)."""
+    """Renders [B, n_samples] mono audio from per-op FM controls. The batch may mix
+    algorithms freely (per-sample `algo` tensor) — see the vectorization note above."""
 
     # ceilings for the bounded learnable calibration (sigmoid * ceiling)
     _CEIL = {"fm": 30.0, "a": 4.0, "d": 8.0, "r": 10.0, "curve": 12.0}
@@ -130,6 +150,11 @@ class DiffOperator(nn.Module):
                              / (sample_rate * self.os))
         if self.os > 1:
             self.register_buffer("aa_kernel", self._make_aa_kernel(self.os))
+        # Routing masks. persistent=False: they're constants derived from ALGORITHMS,
+        # keeping them out of the state dict preserves old-checkpoint compatibility.
+        adj, car = _routing_tensors()
+        self.register_buffer("adj", adj, persistent=False)        # [11,4,4]
+        self.register_buffer("carriers", car, persistent=False)   # [11,4]
 
         init = calib or CalibConstants()
         c = self._CEIL
@@ -179,24 +204,30 @@ class DiffOperator(nn.Module):
         return kernel.view(1, 1, K)
 
     def _decimate(self, x: torch.Tensor) -> torch.Tensor:
-        """[B, n*os] -> [B, n] via anti-alias low-pass then subsample."""
+        """[B, n*os] -> [B, n] anti-alias low-pass + subsample. stride=os makes the conv
+        compute only the samples we keep (identical output, ~os-times cheaper than the
+        old full-resolution conv followed by [::os] slicing)."""
         if self.os == 1:
             return x[:, :self.n]
         pad = self.aa_kernel.shape[-1] // 2
-        x = F.conv1d(x.unsqueeze(1), self.aa_kernel, padding=pad).squeeze(1)
-        return x[:, ::self.os][:, :self.n]
+        x = F.conv1d(x.unsqueeze(1), self.aa_kernel, padding=pad, stride=self.os).squeeze(1)
+        return x[:, :self.n]
 
     def render(
         self,
-        coarse: torch.Tensor,   # [B,4] frequency multipliers
+        coarse: torch.Tensor,   # [B,4] frequency multipliers (ignored if freq_hz given)
         level: torch.Tensor,    # [B,4] op output levels in [0,1]
         adsr_params: torch.Tensor,  # [B,4,4] = (a,d,s,r) per op, each in [0,1]
-        algo: int,              # algorithm index 0..10 (hard-selected)
-        f0: float = 261.63,     # Ableton MIDI note 60 ("C3" label) = 261.6 Hz
-        volume: torch.Tensor | None = None,  # [B] in [0,1]
+        algo: int | torch.Tensor,   # algorithm index 0..10 — int or per-sample [B] long
+        f0: float | torch.Tensor = 261.63,  # fundamental Hz — float or per-sample [B]
         calib: CalibConstants | None = None,  # fixed override (legacy); else learned params
+        freq_hz: torch.Tensor | None = None,  # [B,4] absolute per-op Hz — overrides
+        # f0*coarse. The renderer uses this for the MEASURED frequency laws (floored
+        # ratio x fine multiplier, note-independent fixed oscillators); the legacy
+        # coarse/f0 path remains for calibrate.py and quick tests.
     ) -> torch.Tensor:
-        B = coarse.shape[0]
+        B = level.shape[0]
+        device = level.device
         t = self.t_os                       # render at the oversampled rate
         if calib is not None:               # legacy fixed-constant path
             fm_scale = calib.fm_scale
@@ -207,12 +238,21 @@ class DiffOperator(nn.Module):
             max_a, max_d, max_r = self.max_attack, self.max_decay, self.max_release
             cv_a, cv_d, cv_r = self.curves
 
-        edges = ALGORITHMS[algo]["edges"]
-        carriers = ALGORITHMS[algo]["carriers"]
-        order = _topo_order(edges)
+        if not torch.is_tensor(algo):
+            algo = torch.full((B,), int(algo), dtype=torch.long, device=device)
+        adj = self.adj[algo]                # [B,4,4] per-sample routing
+        car = self.carriers[algo]           # [B,4]
 
-        # base (unmodulated) phase per op: 2*pi*f0*coarse*t
-        phase_base = 2 * math.pi * f0 * coarse.unsqueeze(-1) * t.view(1, 1, -1)  # [B,4,T*os]
+        if freq_hz is None:                 # legacy path: per-op Hz = f0 x coarse ratio
+            if not torch.is_tensor(f0):
+                f0 = torch.full((B,), float(f0), device=device)
+            freq_hz = f0.view(B, 1) * coarse
+        # Phase in CYCLES, computed in fp64 then wrapped to [0,1): at fp32 the raw phase
+        # (~2.4e5 rad at 3 s, ratio 48) has ~0.03 rad quantization — a noise floor the
+        # residual would have to clean up. remainder() keeps the value small so the fp32
+        # sin sees full precision. Differentiable (d remainder/dx = 1 a.e.).
+        cycles = freq_hz.double().unsqueeze(-1) * t.double()
+        phase_base = (2 * math.pi) * torch.remainder(cycles, 1.0).float()  # [B,4,T*os]
         env = torch.stack(
             [adsr(adsr_params[:, i, 0], adsr_params[:, i, 1], adsr_params[:, i, 2],
                   adsr_params[:, i, 3], t, self.note_off,
@@ -220,39 +260,50 @@ class DiffOperator(nn.Module):
             dim=1,
         )  # [B,4,T*os]
 
-        out = [None] * N_OPS  # each op's env-shaped oscillator
-        mods_of = {c: [m for m, car in edges if car == c] for c in range(N_OPS)}
-        for op in order:
-            mod = torch.zeros(B, t.shape[0], device=coarse.device)
-            for m in mods_of[op]:
-                mod = mod + fm_scale * level[:, m].unsqueeze(-1) * out[m]
+        # Fixed topological order D->C->B->A (valid for all algorithms — see invariant).
+        # Each op's modulation input = adjacency-masked sum of already-computed ops.
+        out = [torch.zeros(B, t.shape[0], device=device)] * N_OPS
+        for op in (3, 2, 1, 0):
+            mod = torch.zeros(B, t.shape[0], device=device)
+            for m in range(op + 1, N_OPS):
+                w = adj[:, m, op] * level[:, m]                  # [B] gate x level
+                if w.requires_grad or bool((w != 0).any()):
+                    mod = mod + (fm_scale * w).unsqueeze(-1) * out[m]
             out[op] = env[:, op] * torch.sin(phase_base[:, op] + mod)
 
-        audio = sum(level[:, c].unsqueeze(-1) * out[c] for c in carriers)
+        audio = sum((car[:, c] * level[:, c]).unsqueeze(-1) * out[c] for c in range(N_OPS))
         audio = self._decimate(audio)       # anti-alias + back to base rate
-        if volume is not None:
-            audio = audio * volume.unsqueeze(-1)
-        # normalize headroom (avoid clipping; relative timbre is what matters)
+        # normalize headroom (avoid clipping; relative timbre is what matters).
+        # NOTE: this is exactly why a post-hoc global volume control was a no-op.
         peak = audio.abs().amax(dim=1, keepdim=True).clamp(min=1e-6)
         return audio / peak
 
 
 if __name__ == "__main__":
-    # sanity: render a 2-op FM tone (algo 1 reduced), check sound + differentiability
+    # sanity: render a mixed-algorithm batch, check sound + differentiability
     synth = DiffOperator()
-    B = 2
-    coarse = torch.tensor([[1.0, 2.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]], requires_grad=True)
-    level = torch.tensor([[1.0, 0.6, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]], requires_grad=True)
+    B = 3
+    coarse = torch.tensor([[1.0, 2.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0], [1.0, 3.0, 2.0, 1.0]],
+                          requires_grad=True)
+    level = torch.tensor([[1.0, 0.6, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0], [0.8, 0.5, 0.4, 0.2]],
+                         requires_grad=True)
     adsr_p = torch.zeros(B, 4, 4)
     adsr_p[..., 0] = 0.01  # fast attack
     adsr_p[..., 2] = 0.8   # sustain
     adsr_p[..., 3] = 0.2   # release
-    audio = synth.render(coarse, level, adsr_p, algo=0)
+    algo = torch.tensor([0, 10, 6])                       # mixed algorithms in ONE call
+    f0 = torch.tensor([261.63, 261.63, 523.25])           # mixed pitches in ONE call
+    audio = synth.render(coarse, level, adsr_p, algo, f0=f0)
     loss = audio.pow(2).mean()
     loss.backward()
     print("audio", tuple(audio.shape), "peak", float(audio.abs().max()),
           "rms", float(audio.pow(2).mean().sqrt()))
     print("grad to level:", level.grad is not None and bool(level.grad.abs().sum() > 0))
+    print("grad to coarse:", coarse.grad is not None and bool(coarse.grad.abs().sum() > 0))
     print("grad to fm_scale:", bool(synth.raw_fm.grad is not None and synth.raw_fm.grad.abs() > 0))
     print("calib:", f"fm={float(synth.fm_scale):.2f} a={float(synth.max_attack):.2f} "
           f"d={float(synth.max_decay):.2f} r={float(synth.max_release):.2f}")
+    # legacy scalar path (calibrate.py): int algo + float f0 + fixed constants
+    legacy = synth.render(coarse.detach(), level.detach(), adsr_p, algo=0, f0=261.63,
+                          calib=CalibConstants())
+    print("legacy path ok:", tuple(legacy.shape))

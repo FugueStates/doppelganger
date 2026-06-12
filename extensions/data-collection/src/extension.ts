@@ -36,7 +36,7 @@ import {
   SWEEPS_DIR,
   SEARCH_DIR,
 } from "./config.js";
-import { buildRack, findOperatorTracks, randomizeAll, randomizeNotes, applyParams } from "./operator.js";
+import { buildRack, findOperatorTracks, randomizeAll, randomizeNotes, applyParams, pinNotes } from "./operator.js";
 import { nextBatchId, writeManifest, type BatchInfo } from "./batch.js";
 import { report, formatError } from "./report.js";
 
@@ -50,6 +50,7 @@ export function activate(activation: ActivationContext) {
   register(context, "doppelganger.autoCollect", "doppelganger: Auto Collect", runAutoCollect);
   register(context, "doppelganger.applyPredicted", "doppelganger: Apply Predicted Batch", runApplyPredicted);
   register(context, "doppelganger.runSweeps", "doppelganger: Run Sweeps", runSweeps);
+  register(context, "doppelganger.collectFreqMaps", "doppelganger: Collect Freq Maps", runCollectFreqMaps);
   register(context, "doppelganger.runSearch", "doppelganger: Run Search", runSearch);
 }
 
@@ -136,6 +137,7 @@ async function runSweeps(context: Ctx): Promise<void> {
       continue; // already exported in a previous run
     }
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    if (manifest.kind === "freq_map") continue; // those belong to "Collect Freq Maps"
     const applied = await applyParams(context, tracks, manifest.tracks);
     console.log(`[doppelganger] sweep ${name}: applied ${applied} tracks — waiting for export…`);
     await fs.writeFile(path.join(dir, "READY"), "", "utf8");
@@ -146,6 +148,70 @@ async function runSweeps(context: Ctx): Promise<void> {
     done++;
   }
   await report(context, [`Sweeps: ${done}/${dirs.length} exported.`, `(${reason})`]);
+}
+
+/**
+ * Frequency-mapping collection (pairs with `python -m doppelganger.synth.freq_map gen`):
+ * applies each freq-map sweep folder (dataset/sweeps/fmap_…) and hands off to the Python
+ * watcher to export — the same READY/DONE handshake as Run Sweeps, with ONE crucial
+ * addition: each manifest declares the exact NOTE it must be rendered at, and we PIN
+ * every rack clip to it first. (After Auto Collect the clips hold random pitches —
+ * measuring "what frequency does Coarse 3 produce" at an unknown note is meaningless.)
+ */
+async function runCollectFreqMaps(context: Ctx): Promise<void> {
+  const tracks = findOperatorTracks(context);
+  if (tracks.length === 0) {
+    await report(context, ['No rack found. Run "Build Operator Rack" first.']);
+    return;
+  }
+
+  let dirs: string[];
+  try {
+    const entries = await fs.readdir(SWEEPS_DIR, { withFileTypes: true });
+    dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort();
+  } catch {
+    dirs = [];
+  }
+
+  let found = 0;
+  let done = 0;
+  let reason = "applied all freq-map sweeps";
+  for (const name of dirs) {
+    const dir = path.join(SWEEPS_DIR, name);
+    const manifestPath = path.join(dir, "manifest.json");
+    if (!(await fileExists(manifestPath))) continue;
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    if (manifest.kind !== "freq_map") continue;
+    found++;
+    if (await fileExists(path.join(dir, "DONE"))) {
+      done++;
+      continue; // already exported in a previous run
+    }
+    const pitch = typeof manifest.note === "number" ? manifest.note : 60;
+    const velocity = typeof manifest.velocity === "number" ? manifest.velocity : 100;
+    await pinNotes(context, tracks, pitch, velocity);
+    const applied = await applyParams(context, tracks, manifest.tracks);
+    console.log(
+      `[doppelganger] freq-map ${name}: pinned note ${pitch}/${velocity}, applied ${applied} tracks — waiting for export…`,
+    );
+    await fs.writeFile(path.join(dir, "READY"), "", "utf8");
+    if (!(await waitForFile(path.join(dir, "DONE"), BATCH_TIMEOUT_MS))) {
+      reason = `timed out on ${name} (is the freq_map watcher running?)`;
+      break;
+    }
+    done++;
+  }
+  if (found === 0) {
+    await report(context, [
+      "No freq-map sweeps found. First run:",
+      "  uv run python -m doppelganger.synth.freq_map gen",
+    ]);
+    return;
+  }
+  await report(context, [
+    `Freq maps: ${done}/${found} exported. (${reason})`,
+    "Analyze with: uv run python -m doppelganger.synth.freq_map analyze",
+  ]);
 }
 
 /** "Hear it" eval: apply model-predicted params from the predict manifest to the rack. */

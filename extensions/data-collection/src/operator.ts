@@ -101,6 +101,17 @@ function randInt(lo: number, hi: number): number {
   return lo + Math.floor(Math.random() * (hi - lo + 1));
 }
 
+/** Replaces a track's clip with a fresh one-note clip (the buildRack primitive). */
+async function setClipNote(
+  track: MidiTrack<ApiVersion>,
+  pitch: number,
+  velocity: number,
+): Promise<void> {
+  await track.clearClipsInRange(0, NOTE_BEATS);
+  const clip = await track.createMidiClip(0, NOTE_BEATS);
+  clip.notes = [{ pitch, startTime: 0, duration: NOTE_BEATS, velocity }];
+}
+
 /**
  * Re-randomizes the played note + velocity on every rack track for this batch by
  * REPLACING each track's clip (clear the [0, NOTE_BEATS) range, then create a fresh
@@ -116,12 +127,27 @@ export async function randomizeNotes(
   for (const track of tracks) {
     const pitch = RANDOMIZE_NOTE ? randInt(NOTE_PITCH_MIN, NOTE_PITCH_MAX) : NOTE_PITCH;
     const velocity = RANDOMIZE_NOTE ? randInt(VELOCITY_MIN, VELOCITY_MAX) : NOTE_VELOCITY;
-    await track.clearClipsInRange(0, NOTE_BEATS);
-    const clip = await track.createMidiClip(0, NOTE_BEATS);
-    clip.notes = [{ pitch, startTime: 0, duration: NOTE_BEATS, velocity }];
+    await setClipNote(track, pitch, velocity);
     recorded[track.name] = { pitch, velocity };
   }
   return recorded;
+}
+
+/**
+ * Pins EVERY rack track's clip to one known note + velocity. Measurement sweeps
+ * (freq_map.py) need this: after Auto Collect the rack's clips hold RANDOM pitches,
+ * which would make measured frequencies meaningless — each freq-map manifest declares
+ * the exact note it must be rendered at.
+ */
+export async function pinNotes(
+  context: Ctx,
+  tracks: MidiTrack<ApiVersion>[],
+  pitch: number,
+  velocity: number,
+): Promise<void> {
+  for (const track of tracks) {
+    await setClipNote(track, pitch, velocity);
+  }
 }
 
 /**

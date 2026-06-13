@@ -130,8 +130,19 @@ under Windows spawn ≈ 10 copies, gigabytes of RAM), then re-normalized per ste
 — the shared encoding for encoder/ControlMap/matcher) + `notes.npy` + `vels.npy`, and a
 small `meta.json` (ids + shapes + `version: 2`). ~45 MB at 58k samples, instant load.
 The staleness check now includes the **version**, so the old cache format triggers the
-live-fallback warning instead of a crash. **Rerun `synth.precompute` after adding data**
+live-fallback warning instead of a crash. **Rerun `synth.precompute` after adding data`**
 (unchanged rule).
+
+> **OOM fix (2026-06-13).** All four cache arrays are now opened as memmaps **lazily,
+> per process**, and stripped from the Dataset pickle via `__getstate__`. The first
+> Batch-5 run on the 2×3090 box SIGKILL'd at startup: under DDP's spawn start method the
+> DataLoader pickles the Dataset to each worker, and an **open `np.memmap` held as an
+> attribute serializes its ENTIRE file into the worker** — at ~100k samples that's a
+> ~10 GB private copy per worker per rank, blowing past system RAM (the OOM killer, not
+> CUDA — CUDA OOM is a Python exception). The same code survived at 47k samples; doubling
+> the dataset crossed the RAM ceiling. Lazy-open + `__getstate__` means each worker mmaps
+> the files itself and shares pages through the OS page cache (~0 extra RAM), which is
+> what the "one copy shared across ranks" claim always intended.
 
 ## 7. `inspect_renderer.py`
 

@@ -57,10 +57,17 @@ def _repo_root() -> Path:
 class RendererDataset(Dataset):
     """Yields (normalized params [P] fp32, waveform [T] fp16, note, velocity).
 
-    Fast path: the v2 packed cache (synth.precompute) — audio memmapped fp16 (one copy
-    shared across DDP ranks via the OS page cache), params as a single fp32 matrix.
-    Falls back to live JSON/WAV loading if the cache is absent or stale (version /
+    Fast path: the v2 packed cache (synth.precompute) — all four arrays MEMMAPPED, so
+    one physical copy is shared across DDP ranks AND DataLoader workers via the OS page
+    cache. Falls back to live JSON/WAV loading if the cache is absent or stale (version /
     count / n_samples mismatch).
+
+    CRITICAL (DDP + spawn): the memmaps are opened LAZILY per process and dropped from
+    the pickle (see __getstate__). Holding an OPEN np.memmap as an attribute when the
+    Dataset is pickled to a spawned worker makes numpy serialize the ENTIRE file into
+    that worker — at ~100k samples that's a ~10 GB copy per worker per rank, which
+    OOM-kills the run (SIGKILL) the instant the workers spin up. Opening lazily means
+    each worker mmaps the file itself (shared pages, ~0 extra RAM).
 
     Waveforms stay fp16 until they reach the GPU (halves host->device traffic); the
     trainer casts to fp32 there."""
@@ -69,30 +76,45 @@ class RendererDataset(Dataset):
         self.root = root
         self.cfg = cfg
         self.schema = schema
-        self.audio = self.params = self.notes = self.vels = None
+        self.audio = self.params = self.notes = self.vels = None  # lazy per-process handles
+        self._use_cache = False
         ids_on_disk = sorted(p.stem for p in (root / "params").glob("*.json"))
-        cache = root / "cache"
-        meta_p = cache / "meta.json"
-        if meta_p.exists() and (cache / "audio.npy").exists():
+        self._cache_dir = root / "cache"
+        meta_p = self._cache_dir / "meta.json"
+        if meta_p.exists() and (self._cache_dir / "audio.npy").exists():
             meta = json.loads(meta_p.read_text())
             fresh = (meta.get("version") == CACHE_VERSION
                      and len(meta["ids"]) == len(ids_on_disk)
                      and meta.get("n_samples") == cfg.n_samples)
             if fresh:
                 self.ids = meta["ids"]
-                self.audio = np.load(cache / "audio.npy", mmap_mode="r")
-                self.params = np.load(cache / "params.npy")
-                self.notes = np.load(cache / "notes.npy")
-                self.vels = np.load(cache / "vels.npy")
+                self._use_cache = True
             else:
                 print("[dataset] cache stale (version / sample count / n_samples changed) — "
                       "live loading; rerun `python -m doppelganger.synth.precompute`")
-        if self.audio is None:  # live fallback
+        if not self._use_cache:  # live fallback
             self.ids = ids_on_disk
             self._mem: dict[int, tuple] = {}
         if not self.ids:
             raise RuntimeError(f"No params under {root/'params'} — regenerate the dataset.")
         self.positions = list(range(len(self.ids)))
+
+    def _ensure_open(self) -> None:
+        """Open the cache memmaps in THIS process (idempotent). Never call before
+        pickling — __getstate__ guarantees the handles are absent from the pickle."""
+        if self.audio is None:
+            self.audio = np.load(self._cache_dir / "audio.npy", mmap_mode="r")
+            self.params = np.load(self._cache_dir / "params.npy", mmap_mode="r")
+            self.notes = np.load(self._cache_dir / "notes.npy", mmap_mode="r")
+            self.vels = np.load(self._cache_dir / "vels.npy", mmap_mode="r")
+
+    def __getstate__(self):
+        # Strip open memmap handles before pickling to a worker — otherwise numpy
+        # serializes each file's full contents into the worker (the OOM bug). The worker
+        # re-opens them lazily via _ensure_open() and shares pages through the page cache.
+        state = self.__dict__.copy()
+        state["audio"] = state["params"] = state["notes"] = state["vels"] = None
+        return state
 
     def restrict_to_note(self, note: int = 60) -> None:
         """Keep only samples played at `note`. REQUIRED when the model isn't pitch-
@@ -106,7 +128,8 @@ class RendererDataset(Dataset):
                   f"{len(self.positions)} note={note} samples, dropped {dropped} pitch-diverse")
 
     def _note(self, i: int) -> int:
-        if self.notes is not None:
+        if self._use_cache:
+            self._ensure_open()
             return int(self.notes[i])
         d = json.loads((self.root / "params" / f"{self.ids[i]}.json").read_text())
         return int(d.get("note", 60))
@@ -122,10 +145,11 @@ class RendererDataset(Dataset):
 
     def __getitem__(self, idx):
         i = self.positions[idx]
-        if self.audio is not None:  # cached fast path — pure array indexing
-            return (torch.from_numpy(self.params[i]),
-                    torch.from_numpy(self.audio[i].copy()),            # fp16; copy off the
-                    float(self.notes[i]), float(self.vels[i]))         # read-only memmap
+        if self._use_cache:  # cached fast path — pure (memmapped) array indexing
+            self._ensure_open()
+            return (torch.from_numpy(self.params[i].copy()),       # copy off the
+                    torch.from_numpy(self.audio[i].copy()),        # read-only memmaps
+                    float(self.notes[i]), float(self.vels[i]))
         if i not in self._mem:  # live fallback: parse once, keep in RAM (fp16 wave)
             sid = self.ids[i]
             d = json.loads((self.root / "params" / f"{sid}.json").read_text())

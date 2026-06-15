@@ -216,7 +216,12 @@ class HybridRenderer(nn.Module):
         B, _, n_freq, n_time = phys.shape
         x = torch.cat([phys, self._freq_encoding(n_freq, n_time, B, device)], dim=1)
         h = self.in_block(x, code)
-        ckpt = self.cfg.grad_checkpoint and self.training
+        # Gate checkpointing on GRAD-ENABLED, not .training: checkpointing only matters for
+        # the backward pass, and the matcher backprops its audio loss through this FROZEN
+        # (eval-mode) renderer to the input params — without checkpointing here the residual
+        # over 3 STFT resolutions OOMs a 24 GB card. Under no_grad (the renderer's own eval /
+        # inspect / the matcher's DDIM sampling) it's a no-op, so nothing else changes.
+        ckpt = self.cfg.grad_checkpoint and torch.is_grad_enabled()
         for blk in self.mid:
             # checkpointing stores far fewer activations (recomputes them in backward) —
             # the residual runs over 3 resolutions so this is the main VRAM lever.

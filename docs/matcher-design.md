@@ -78,9 +78,21 @@ Key decisions:
   analogous to the renderer's gate). `gain%` > 0 means the matcher genuinely matches.
   Also reports Algorithm top-1 accuracy.
 
-Defaults: `--w-audio 1 --w-diff 1 --w-algo 1`, 1000 train timesteps, 25 DDIM eval steps.
-v1 is single-device (the renderer forward each step makes it heavier than renderer
-training); DDP is a follow-up if throughput needs it.
+Defaults: `--w-audio 1 --w-diff 1 --w-algo 1`, 1000 train timesteps, 25 DDIM eval steps,
+**batch 16** (the renderer's residual over 3 STFT resolutions is the VRAM driver). v1 is
+single-device (the renderer forward each step makes it heavier than renderer training);
+DDP is a follow-up if throughput needs it.
+
+**VRAM note (the gradient-checkpointing gate).** The matcher backprops the audio loss
+through the *frozen, eval-mode* renderer to the input params. The renderer's checkpointing
+was originally gated on `self.training`, which is False for a frozen renderer → no
+checkpointing → the residual's full activation graph over 3 resolutions OOM'd a 24 GB card.
+Fixed by gating checkpointing on `torch.is_grad_enabled()` instead (correct anyway —
+checkpointing only matters for the backward pass): it now fires during the matcher's
+backprop and stays a no-op under `no_grad` (the renderer's own eval / inspect / the
+matcher's DDIM sampling). `load_frozen_renderer` also force-sets `grad_checkpoint=True`
+so a renderer trained with `--no-grad-ckpt` still fits. If VRAM is still tight, lower
+`--batch-size` or set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
 ## Inference (`match.py`)
 

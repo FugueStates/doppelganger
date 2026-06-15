@@ -22,6 +22,7 @@ Requires a trained renderer (models/operator/renderer.pt) + the dataset cache.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -42,6 +43,10 @@ def load_frozen_renderer(ckpt_path: Path, schema: OperatorSchema, device: str):
     """Rebuild the renderer with its training-time config, load EMA weights, freeze."""
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     cfg = cfg_from_checkpoint(ck)
+    # Force gradient checkpointing on: the matcher backprops through this renderer and the
+    # residual won't fit otherwise (grad_checkpoint doesn't affect architecture, so this is
+    # safe for load_state_dict even if the renderer was trained with --no-grad-ckpt).
+    cfg = dataclasses.replace(cfg, grad_checkpoint=True)
     renderer = HybridRenderer(schema, cfg).to(device)
     renderer.load_state_dict(ck["state_dict"])
     renderer.eval()
@@ -95,7 +100,8 @@ def main():
     ap.add_argument("--renderer", default=str(root / "models" / "operator" / "renderer.pt"))
     ap.add_argument("--out", default=str(root / "models" / "operator" / "matcher.pt"))
     ap.add_argument("--epochs", type=int, default=60)
-    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--batch-size", type=int, default=16,
+                    help="the renderer's residual (3 STFT res) is the VRAM driver; 16 fits a 3090, raise if it fits")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)

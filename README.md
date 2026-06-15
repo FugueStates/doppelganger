@@ -52,9 +52,10 @@ doppelganger/
   src/doppelganger/                    Python package (uv)
     schema.py  audio.py
     datagen/   split_export.py  export_ableton.py  run_loop.py
-    synth/     renderer.py train_renderer.py inspect_renderer.py   ← CURRENT (audio-objective)
+    synth/     renderer.py train_renderer.py inspect_renderer.py   ← Tool 2 (neural renderer)
                diff_operator.py spectral.py adapter.py precompute.py
                freq_map.py sensitivity.py search.py sweeps.py run_sweeps.py calibrate.py
+    matcher/   model.py diffusion.py train_matcher.py match.py     ← Tool 2.5 (one-shot matcher)
     training/  (DEPRECATED param-regression: config/features/codec/data/model/train/eval/…)
   dataset/operator/{wav,params}/       generated dataset (gitignored; params JSON now also
                                        records `note` + `velocity` per sample)
@@ -214,8 +215,34 @@ Renderer/loss settings live in `synth/renderer.py` (`RendererConfig`: multi-res 
 oversample, f0) and `synth/spectral.py` (energy-weighted + spectral-convergence +
 frequency-transport losses). The FM physics core is `synth/diff_operator.py`.
 
-> **One-shot matcher** (diffusion, `input audio → params`, trained through the frozen
-> renderer) is the next tool to build once renderer fidelity is locked — see `docs/PLAN.md`.
+---
+
+## Tool 2.5 — One-shot matcher (diffusion, audio → params)
+
+Trains `input audio → Operator params` with the magnitude-weighted spectral loss
+backpropped **through the frozen renderer** (audio loss is the driver; a diffusion x0 /
+param term is the nudge). The discrete **Algorithm** gets a dedicated classifier head; a
+FiLM-conditioned MLP diffusion denoiser models the other 194 params. See
+[docs/matcher-design.md](docs/matcher-design.md).
+
+```powershell
+# train against the frozen renderer (needs models/operator/renderer.pt + the dataset cache)
+uv run python -m doppelganger.matcher.train_matcher --epochs 60
+#   eval prints val match audio loss vs a predict-the-mean-params baseline (gain% > 0 =
+#   real matching) + Algorithm top-1 accuracy. Best checkpoint -> models/operator/matcher.pt
+#   flags: --w-audio/--w-diff/--w-algo (loss weights) --batch-size N --eval-steps N (DDIM)
+
+# inference: match a target sound -> ranked candidate presets -> predict manifest
+uv run python -m doppelganger.matcher.match --target "dataset\operator\wav\0000000.wav" `
+    --note 60 --velocity 100 --candidates 16
+# then in Live: right-click -> "doppelganger: Apply Predicted Batch" -> Export to hear them
+# (op_0000 = best; the ranked population is the seed set for the CMA-ES polish below)
+```
+
+The matcher DDIM-samples a *population* of candidates (the param→sound map is many-to-one,
+so several presets can match), renders them all through the frozen renderer, and ranks by
+spectral loss. Pass the played `--note/--velocity` (the renderer is pitch-conditioned);
+automatic f0 detection is a Tool-3 follow-up.
 
 ### In-the-loop CMA-ES search (real Operator, optional inference polish)
 Refines a preset directly against the real Operator (population 64 = one export):
@@ -238,9 +265,8 @@ run but are not part of the current workflow.
 
 ## Status
 
-- ✅ Tool 1 (data collection) — automated; ~47k C3 samples; collector now varies note+velocity
-  (collecting ~50k pitch-diverse samples for Batch 5).
-- 🔵 Tool 2 (neural renderer) — training on 2×3090 (DDP, bf16). **Architecture locked** after a
+- ✅ Tool 1 (data collection) — automated; ~100k samples across notes 36–84 (C3 + pitch-diverse).
+- ✅ Tool 2 (neural renderer) — **FAITHFUL, gate passed.** Trained on 2×3090 (DDP, bf16). After a
   batch-by-batch study on the loud-bin fidelity metric:
   - Batch 1 (multi-res STFT + frequency-transport loss + EMA): **+42%** loud-bin gap ✅
   - Batch 2 (anti-aliased + self-calibrating physics core): wash at C3 (residual isn't
@@ -260,12 +286,20 @@ run but are not part of the current workflow.
     `Hz = 10^(floor(mul)−3)·200^fixfreq` (exact exponential; floor confirmed by the
     boundary sweep), Quantize is a no-op for the ratio. All ~0-cent residual — the
     prior's frequency placement now matches the real device exactly.
-  - **Next:** retrain from scratch on the full pitch-diverse dataset (~50k new samples
-    being collected) and gate on `inspect_renderer`.
-- ⬜ One-shot diffusion matcher — after the pitch-conditioned renderer is faithful.
-  (Gradient path through the frozen renderer is now verified; remaining design decision:
-  how the matcher handles the discrete Algorithm/On-off params.)
-- ⬜ Tool 3 (inference extension) — not yet built.
+  - **GATE PASSED (2026-06-15):** pitch-conditioned renderer trained on the full diverse
+    dataset (best_val 1.19 @ ep70) — canonical loud-bin gap **+50.3%** scored across notes
+    36–84, *matching* the old C3-only +50.1% while generalizing across pitch (512 → +57%,
+    2048 → +47%; energy-wt win 100%). Frozen → it now provides the matcher's audio loss.
+- 🔵 Tool 2.5 (one-shot diffusion matcher) — **✅ BUILT + smoke-tested (2026-06-15,** see
+  `docs/matcher-design.md`**).** `audio → params`, magnitude-weighted spectral loss
+  backpropped through the frozen renderer; **separate Algorithm classifier** + FiLM-MLP
+  x0-diffusion denoiser over the other 194 params; inference samples a candidate population
+  and ranks by renderer loss. Gradient-to-params through the frozen renderer verified.
+  **Next:** train on the box vs the real renderer; read eval `gain%` vs the mean-params
+  baseline + Algorithm accuracy.
+- ⬜ Phase C — CMA-ES polish (real Operator) seeded by the matcher's ranked candidates
+  (`synth/search.py` exists).
+- ⬜ Tool 3 (inference extension + YIN pitch detection) — not yet built.
 
 See `docs/PLAN.md` → **CURRENT PLAN (v3)** for the full phased roadmap.
 

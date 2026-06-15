@@ -80,6 +80,26 @@ def normalize_params(param_dicts: list[dict], schema: OperatorSchema) -> torch.T
     return out.clamp(0, 1)
 
 
+def denormalize_params(vec, schema: OperatorSchema) -> dict:
+    """Inverse of normalize_params for ONE preset: normalized [P] in [0,1] -> {name: raw}.
+
+    Mirrors the adapter convention exactly (quantized raw index = round(norm*(card-1));
+    continuous = min + norm*span). This is deliberately NOT schema.Param.denormalize —
+    that treats a quantized `norm` as ALREADY being the index, whereas the whole
+    matcher/renderer pipeline stores quantized params as index/(card-1) in [0,1]. Using
+    the wrong one silently corrupts every multi-option categorical (Algorithm, waveforms,
+    filter type, envelope modes) when the predicted preset is applied to the real device."""
+    out = {}
+    for i, pa in enumerate(schema.params):
+        v = float(vec[i])
+        if pa.is_quantized:
+            card = pa.cardinality or 1
+            out[pa.name] = float(min(card - 1, max(0, round(v * max(card - 1, 1)))))
+        else:
+            out[pa.name] = pa.min + min(1.0, max(0.0, v)) * (pa.max - pa.min)
+    return out
+
+
 class ControlMap(nn.Module):
     """Differentiable normalized-params [B,P] -> DiffOperator controls.
 

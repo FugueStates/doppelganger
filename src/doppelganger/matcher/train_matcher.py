@@ -33,8 +33,9 @@ from torch.utils.data import DataLoader
 from ..schema import OperatorSchema
 from ..synth.inspect_renderer import cfg_from_checkpoint
 from ..synth.renderer import HybridRenderer
-from ..synth.spectral import renderer_loss
-from ..synth.train_renderer import RendererDataset, collate, hash_split, _repo_root
+from ..synth.spectral import renderer_loss, renderer_loss_per_sample
+from ..synth.train_renderer import (Ema, RendererDataset, collate, ema_weights,
+                                    hash_split, _repo_root)
 from .diffusion import Diffusion
 from .model import Matcher
 
@@ -111,6 +112,7 @@ def main():
     ap.add_argument("--w-audio", type=float, default=1.0, help="audio-loss weight (the driver)")
     ap.add_argument("--w-diff", type=float, default=1.0, help="diffusion x0-MSE / param-nudge weight")
     ap.add_argument("--w-algo", type=float, default=1.0, help="algorithm cross-entropy weight")
+    ap.add_argument("--ema-decay", type=float, default=0.999)
     ap.add_argument("--steps", type=int, default=1000, help="diffusion train timesteps")
     ap.add_argument("--eval-steps", type=int, default=25, help="DDIM steps at eval")
     ap.add_argument("--eval-every", type=int, default=2)
@@ -149,6 +151,7 @@ def main():
         milestones=[warmup]) if warmup else \
         torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
 
+    ema = Ema(matcher, args.ema_decay)
     mean_p = mean_params(DataLoader(tr, batch_size=args.batch_size, **dl_kw),
                          len(schema.params), device)
     out = Path(args.out); out.parent.mkdir(parents=True, exist_ok=True)
@@ -177,7 +180,14 @@ def main():
                 x0_hat = matcher.x0(x_t, t, cond)
                 full = matcher.assemble(x0_hat, true_algo)
                 preds = renderer(full, device, note=notes, velocity=vels)
-            audio = renderer_loss({k: v.float() for k, v in preds.items()}, target, args.alpha)
+            # SNR-weight the audio loss by the diffusion signal level alpha_bar[t]: at high
+            # noise the denoiser CAN'T predict a clean x0, so supervising its sound there
+            # just fights the diffusion objective (the rising-x0-MSE pathology). Near-clean
+            # steps (alpha_bar -> 1) get full audio supervision; pure-noise steps ~none.
+            audio_ps = renderer_loss_per_sample({k: v.float() for k, v in preds.items()},
+                                                target, args.alpha)
+            w = diffusion.alpha_bar[t]
+            audio = (w * audio_ps).sum() / w.sum().clamp_min(1e-8)
             diff = F.mse_loss(x0_hat.float(), x0_true)
             ce = F.cross_entropy(algo_logits.float(), true_algo)
             loss = args.w_audio * audio + args.w_diff * diff + args.w_algo * ce
@@ -187,13 +197,15 @@ def main():
             if args.clip > 0:
                 torch.nn.utils.clip_grad_norm_(matcher.parameters(), args.clip)
             opt.step()
+            ema.update(matcher)
             run_a += audio.item(); run_d += diff.item(); run_c += ce.item(); nb += 1
         sched.step()
 
         if epoch % args.eval_every == 0 or epoch == args.epochs:
-            match_l, base_l, algo_acc = evaluate(
-                matcher, diffusion, renderer, va_dl, device, canon, mean_p,
-                args.eval_steps, args.alpha, args.eval_batches)
+            with ema_weights(matcher, ema):  # evaluate (and deploy) the EMA weights
+                match_l, base_l, algo_acc = evaluate(
+                    matcher, diffusion, renderer, va_dl, device, canon, mean_p,
+                    args.eval_steps, args.alpha, args.eval_batches)
             gain = 100 * (base_l - match_l) / base_l
             improved = match_l < best - 1e-4
             print(f"epoch {epoch:3} | train audio={run_a/max(nb,1):.4f} diff={run_d/max(nb,1):.4f} "
@@ -201,8 +213,12 @@ def main():
                   f"(gain {gain:+.1f}%) algo_acc={algo_acc:.3f}{'  <- best' if improved else ''}")
             if improved:
                 best = match_l
-                torch.save({"state_dict": matcher.state_dict(), "epoch": epoch,
-                            "best_match": best, "n_steps": args.steps,
+                # deploy = EMA weights (all matcher params are float, so EMA covers them).
+                deploy_sd = {k: ema.shadow[k].cpu() if k in ema.shadow else v.cpu()
+                             for k, v in matcher.state_dict().items()}
+                torch.save({"state_dict": deploy_sd, "raw_state_dict": matcher.state_dict(),
+                            "ema": ema.shadow, "epoch": epoch, "best_match": best,
+                            "n_steps": args.steps,
                             "renderer_ckpt": str(Path(args.renderer).resolve())}, out)
         else:
             print(f"epoch {epoch:3} | train audio={run_a/max(nb,1):.4f} diff={run_d/max(nb,1):.4f} "

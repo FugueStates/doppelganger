@@ -119,5 +119,29 @@ C3/100). Detecting f0 from the input automatically (YIN) is a Tool-3 follow-up.
   mean-params baseline and Algorithm accuracy. Then Phase C (CMA-ES polish seeded by the
   ranked candidates) and Tool 3 (the inference extension + YIN pitch detection).
 - Possible refinements if quality needs it: classifier-free guidance on the conditioning,
-  gating the audio loss by diffusion noise level (apply more at low-noise t), EMA weights,
   DDP.
+
+## v1.1 stabilization (2026-06-16, from the first full run)
+
+The first 60-epoch run on the box revealed three things; the continuous matcher worked
+(val match **+33%** vs the mean-params baseline, improving) but:
+
+1. **The diffusion x0-MSE rose (0.57 → 3-4) instead of falling.** Diagnosis: the data
+   lives in [-1,1] but the denoiser output was unbounded, and the audio loss only sees the
+   *clamped* x0 (via `assemble`), so for a many-to-one synth the audio gradient drove the
+   raw prediction far past the rails to chase a sound match — exploding the x0-MSE and
+   feeding the DDIM sampler out-of-distribution x0 estimates (unstable, bouncy val).
+   **Fixes:** (a) **tanh-bound the denoiser output** to [-1,1] by construction; (b)
+   **SNR-weight the audio loss** by `alpha_bar[t]` — at high noise the denoiser can't
+   predict a clean x0, so supervising its *sound* there only fights the diffusion
+   objective; near-clean steps get full audio supervision, pure-noise steps ~none
+   (`renderer_loss_per_sample` in `spectral.py` makes the per-timestep weighting possible).
+   In smoke tests the x0-MSE now stays flat instead of diverging.
+2. **The Algorithm classifier sat at chance** (CE ≈ ln 11, acc ≈ 0.10). FM topology is
+   largely under-identifiable from one random-preset one-shot (a modulator at ~0 level or
+   an oscillator off hides the routing). **Fix:** don't trust the argmax — `match.py`
+   `--algo-topk` (default 3) spreads the candidate population across the classifier's
+   top-k algorithms and lets the renderer-ranking pick. (Smoke test: classifier top-1 was
+   Algorithm 1, but the ranking chose an Algorithm 6 candidate.)
+3. **Bouncy val** (no EMA). **Fix:** EMA of the matcher weights (decay 0.999), evaluated +
+   deployed like the renderer's; checkpoint carries `state_dict` (EMA) + `raw_state_dict`.

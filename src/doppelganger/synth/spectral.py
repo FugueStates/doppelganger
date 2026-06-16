@@ -77,3 +77,28 @@ def renderer_loss(preds: dict[int, torch.Tensor], targets: dict[int, torch.Tenso
         total = total + energy_weighted_logmag_l1(p, t, alpha) \
             + w_sc * spectral_convergence(p, t) + w_ot * freq_transport_l1(p, t)
     return total / len(preds)
+
+
+def renderer_loss_per_sample(preds: dict[int, torch.Tensor], targets: dict[int, torch.Tensor],
+                             alpha: float = 10.0, w_sc: float = 1.0, w_ot: float = 1.0) -> torch.Tensor:
+    """Per-sample [B] version of renderer_loss — same three terms, reduced over (F,T) only,
+    averaged over resolutions. Used to SNR-weight the matcher's audio loss per timestep
+    (the scalar renderer_loss can't be weighted per sample)."""
+    total = None
+    for k in preds:
+        p, t = preds[k], targets[k]
+        B = t.shape[0]
+        w = t.exp()
+        w = w / w.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-9)
+        weight = 1.0 + alpha * w
+        ew = (weight * (p - t).abs()).sum(dim=(-2, -1)) / weight.sum(dim=(-2, -1))   # [B]
+        P, T = p.exp(), t.exp()
+        num = torch.linalg.vector_norm((T - P).reshape(B, -1), dim=1)
+        den = torch.linalg.vector_norm(T.reshape(B, -1), dim=1).clamp_min(1e-9)
+        sc = num / den                                                                # [B]
+        Pn = P / P.sum(dim=-2, keepdim=True).clamp_min(1e-8)
+        Tn = T / T.sum(dim=-2, keepdim=True).clamp_min(1e-8)
+        ot = (Pn.cumsum(dim=-2) - Tn.cumsum(dim=-2)).abs().mean(dim=(-2, -1))         # [B]
+        term = ew + w_sc * sc + w_ot * ot
+        total = term if total is None else total + term
+    return total / len(preds)

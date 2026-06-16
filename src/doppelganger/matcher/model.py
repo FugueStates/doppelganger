@@ -91,7 +91,11 @@ class ParamDenoiser(nn.Module):
         h = self.in_proj(x_t)
         for blk in self.blocks:
             h = blk(h, c)
-        return self.out(h)
+        # tanh-bound x0 to the data range [-1,1]: normalized params live there, and without
+        # the bound the audio loss (which only sees the CLAMPED x0 via assemble) drives the
+        # raw prediction far past the rails to chase the many-to-one sound match — which
+        # blows up the x0-MSE and feeds the DDIM sampler out-of-distribution x0 estimates.
+        return torch.tanh(self.out(h))
 
 
 class Matcher(nn.Module):

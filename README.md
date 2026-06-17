@@ -189,7 +189,7 @@ uv run python -m doppelganger.synth.train_renderer --epochs 80
 Train/val membership is a stable per-id hash (`crc32(id) % 10`), so adding data never
 reshuffles which samples are held out. The renderer's `forward` also accepts the
 normalized param matrix as a **tensor** (differentiable end-to-end into the physics) —
-this is the interface the diffusion matcher trains through. See
+this is the interface the matcher trains through. See
 [docs/batch5-refactor.md](docs/batch5-refactor.md) for the full change log + reasoning.
 
 **Validate fidelity** (the decisive metric — energy-weighted / top-10%-loud-bin log-mag L1
@@ -217,32 +217,35 @@ frequency-transport losses). The FM physics core is `synth/diff_operator.py`.
 
 ---
 
-## Tool 2.5 — One-shot matcher (diffusion, audio → params)
+## Tool 2.5 — One-shot matcher (direct, audio → params)
 
-Trains `input audio → Operator params` with the magnitude-weighted spectral loss
-backpropped **through the frozen renderer** (audio loss is the driver; a diffusion x0 /
-param term is the nudge). The discrete **Algorithm** gets a dedicated classifier head; a
-FiLM-conditioned MLP diffusion denoiser models the other 194 params. See
-[docs/matcher-design.md](docs/matcher-design.md).
+Trains `input audio → Operator params` as a **deterministic one-shot predictor**: an audio
+encoder feeds an Algorithm classifier (the one discrete param) and a parameter head that
+emits the other 194 params in a single forward pass, **confined to the audible dataset
+manifold**, trained with the magnitude-weighted spectral loss through the frozen renderer +
+a param anchor + algorithm cross-entropy. The manifold bounding is what keeps predictions
+audible — an earlier audio-loss-driven diffusion version railed params to silent/extreme
+values that gamed the renderer's slack. Designed to ship in the extension as ONNX on CPU
+(no synth in the loop). See [docs/matcher-design.md](docs/matcher-design.md).
 
 ```powershell
 # train against the frozen renderer (needs models/operator/renderer.pt + the dataset cache)
 uv run python -m doppelganger.matcher.train_matcher --epochs 60
 #   eval prints val match audio loss vs a predict-the-mean-params baseline (gain% > 0 =
 #   real matching) + Algorithm top-1 accuracy. Best checkpoint -> models/operator/matcher.pt
-#   flags: --w-audio/--w-diff/--w-algo (loss weights) --batch-size N --eval-steps N (DDIM)
+#   flags: --w-audio/--w-param/--w-algo (loss weights) --batch-size N --algo-topk N
 
 # inference: match a target sound -> ranked candidate presets -> predict manifest
 uv run python -m doppelganger.matcher.match --target "dataset\operator\wav\0000000.wav" `
-    --note 60 --velocity 100 --candidates 16
+    --note 60 --velocity 100 --candidates 5
 # then in Live: right-click -> "doppelganger: Apply Predicted Batch" -> Export to hear them
-# (op_0000 = best; the ranked population is the seed set for the CMA-ES polish below)
+# (op_0000 = best-ranked of the top-k-algorithm predictions)
 ```
 
-The matcher DDIM-samples a *population* of candidates (the param→sound map is many-to-one,
-so several presets can match), renders them all through the frozen renderer, and ranks by
-spectral loss. Pass the played `--note/--velocity` (the renderer is pitch-conditioned);
-automatic f0 detection is a Tool-3 follow-up.
+The matcher predicts one preset per top-k Algorithm (`--candidates`), renders them through
+the frozen **neural** renderer (CPU, no real render), and ranks by spectral loss — robust
+to the weak Algorithm classifier. Pass the played `--note/--velocity` (the renderer is
+pitch-conditioned); automatic f0 detection is a Tool-3 follow-up.
 
 ### In-the-loop CMA-ES search (real Operator, optional inference polish)
 Refines a preset directly against the real Operator (population 64 = one export):
@@ -290,16 +293,22 @@ run but are not part of the current workflow.
     dataset (best_val 1.19 @ ep70) — canonical loud-bin gap **+50.3%** scored across notes
     36–84, *matching* the old C3-only +50.1% while generalizing across pitch (512 → +57%,
     2048 → +47%; energy-wt win 100%). Frozen → it now provides the matcher's audio loss.
-- 🔵 Tool 2.5 (one-shot diffusion matcher) — **✅ BUILT + smoke-tested (2026-06-15,** see
-  `docs/matcher-design.md`**).** `audio → params`, magnitude-weighted spectral loss
-  backpropped through the frozen renderer; **separate Algorithm classifier** + FiLM-MLP
-  x0-diffusion denoiser over the other 194 params; inference samples a candidate population
-  and ranks by renderer loss. Gradient-to-params through the frozen renderer verified.
-  **Next:** train on the box vs the real renderer; read eval `gain%` vs the mean-params
-  baseline + Algorithm accuracy.
-- ⬜ Phase C — CMA-ES polish (real Operator) seeded by the matcher's ranked candidates
-  (`synth/search.py` exists).
-- ⬜ Tool 3 (inference extension + YIN pitch detection) — not yet built.
+- 🔵 Tool 2.5 (one-shot matcher) — **DETERMINISTIC direct predictor, BUILT + smoke-tested**
+  (2026-06-17, see `docs/matcher-design.md`). `audio → params` in one forward pass:
+  AudioEncoder → Algorithm classifier + ParamHead, the 194 non-Algorithm params confined
+  to the **audible dataset manifold** so predictions stay playable; trained with the
+  spectral loss through the frozen renderer + param anchor + algorithm CE; inference
+  predicts per top-k algorithm and ranks via the neural renderer (CPU, no real render).
+  - *History:* a first audio-loss-driven **diffusion** version trained but railed params to
+    silent/extreme values that gamed the renderer's slack (Volume→−∞, Transpose→+48);
+    replaced by the manifold-bounded deterministic predictor above, which is also the
+    simplest thing to ship as ONNX in the extension.
+  - **Next:** train on the box vs the real renderer; read eval `gain%` + Algorithm acc, then
+    hear `op_0000` via Apply Predicted Batch.
+- ⬜ Tool 3 (inference extension) — `matcher.onnx` (+ optional `renderer.onnx` ranker) on
+  CPU in-extension, + YIN pitch detection on the input. Not yet built.
+- ⬜ (Dev-only, optional) CMA-ES polish against the real Operator (`synth/search.py`) — a
+  power-user refinement, not part of the shipped extension (needs real renders).
 
 See `docs/PLAN.md` → **CURRENT PLAN (v3)** for the full phased roadmap.
 

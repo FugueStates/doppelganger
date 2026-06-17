@@ -1,10 +1,10 @@
 """
 Phase B — the one-shot matcher (input audio -> Operator params).
 
-A conditional diffusion model over the normalized parameter vector, conditioned on an
-embedding of the target audio, trained with the magnitude-weighted spectral loss
-backpropped THROUGH the frozen neural renderer (the audio loss is the driver; a diffusion
-x0 / param term is the nudge). The discrete Algorithm is handled by a SEPARATE classifier
-head (decided 2026-06-15); the diffusion denoiser models only the remaining continuous +
-binary params. See docs/matcher-design.md.
+A DETERMINISTIC predictor: an audio encoder feeds an Algorithm classifier (the one
+discrete param) and a parameter head that emits, in a single forward pass, the other 194
+params confined to the audible dataset manifold. Trained with the magnitude-weighted
+spectral loss backpropped THROUGH the frozen neural renderer (perceptual driver) + a
+param-anchor MSE + algorithm cross-entropy. Designed to ship in the extension as ONNX on
+CPU — audio -> params in one shot, no synth in the loop. See docs/matcher-design.md.
 """

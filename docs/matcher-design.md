@@ -1,10 +1,83 @@
-# Phase B — One-shot matcher design (2026-06-15)
+# Phase B — One-shot matcher design
+
+> **v2 (2026-06-17) — DETERMINISTIC, MANIFOLD-BOUNDED. Supersedes the diffusion design
+> below (kept as history).** The matcher is `input audio → Operator params` in a single
+> forward pass, trained with the magnitude-weighted spectral loss through the frozen
+> renderer. Code: `src/doppelganger/matcher/` (`model.py`, `train_matcher.py`, `match.py`;
+> `diffusion.py` removed).
+
+## v2 — what it is and why it changed
+
+**The product constraint (the thing that drove the redesign):** this ships inside an
+Ableton extension as `audio → params`, instant, on CPU, with **no synth in the loop** —
+the SDK can't render an instrument, so any approach that needs real-Operator renders
+(CMA-ES) is a dev tool, not the product. So the matcher must predict *directly*.
+
+**Why deterministic, not diffusion.** The diffusion version (history below) had two fatal
+behaviours on this problem: its x0-MSE *rose* instead of falling (the diffusion objective
+was vestigial), and — driven by the audio loss — it **railed params to extremes that game
+the renderer's slack**: Volume → 0 (the renderer's targets are peak-normalized, so Volume
+is invisible to it → no gradient → it rails → −∞ dB, silent), Transpose → +48, envelopes
+→ instant. The renderer-space metric looked fine (+31%) because the renderer ignores those
+params; the *real* Operator doesn't, so the applied presets were insane. A deterministic
+predictor is simpler, is the most direct realization of the product, and removes the
+vestigial machinery.
+
+**The fix for railing — confine predictions to the audible data manifold.** The dataset
+was collected with `SAMPLING_RULES` that make every training preset audible by
+construction (Volume ∈ [0.45,1], Transpose ∈ ±12, device on, carrier audible…). We
+compute the per-param observed `[min,max]` over the training set (the **manifold box**)
+and the ParamHead's `sigmoid` output is mapped **affinely** into that box. So:
+- the predictor can only emit presets inside the audible distribution the renderer was
+  trained on — Volume can't go below ~0.45, Transpose can't exceed ±12, forced params
+  (Device On, etc.) are pinned automatically because their box has zero width;
+- the audio loss still has smooth gradient *everywhere inside* the box, so it matches
+  within the manifold — but it physically **cannot escape** to chase the renderer's slack.
+
+This is the structural fix: the railing isn't penalized, it's made impossible.
+
+### v2 architecture (`model.py`)
+
+```
+target wav ─► renderer.target_logmag ─► AudioEncoder ─► z ──┬─► AlgoClassifier ─► 11-way logits
+                                                            │
+                                          note, velocity ───┼─► cond ─► ParamHead (MLP, sigmoid)
+                                          (z, algo embed) ──┘            └► affine into manifold box ─► 194 params
+```
+- **AudioEncoder** — strided 2-D CNN over the canonical log-mag → 256-d `z`.
+- **AlgoClassifier** — `z → 11-way softmax` over Algorithm (the one discrete param, kept
+  out of the continuous head; same rationale as before).
+- **ParamHead** — residual MLP, `sigmoid` output, affine-mapped into the manifold box for
+  the other 194 params. Deterministic: one forward pass, no sampling.
+
+### v2 training (`train_matcher.py`)
+
+`total = w_audio · audio  +  w_param · MSE(pos, true position-in-manifold)  +  w_algo · CE`.
+The audio loss (through the frozen renderer) is the perceptual driver; the param-anchor
+keeps predictions on real presets and breaks many-to-one ties toward plausible ones; the
+manifold mapping makes both safe. True algorithm is teacher-forced into the render so a
+classifier mistake can't poison the continuous head; EMA weights; eval mirrors inference
+(predict for the top-k algorithms, render each through the renderer, keep the best per
+sample, vs the mean-params baseline). Smoke-tested: predicted presets come out audible and
+in-range (`Volume 0.77`, `Transpose 0.62`, `Device On 1`) instead of silent/railed.
+
+### v2 inference (`match.py`) + deployment
+
+Encode → classify Algorithm → predict ONE preset per top-k algorithm → render all through
+the frozen **neural** renderer (CPU, no real render) → rank by spectral loss → `op_0000` =
+best. The whole path is what ships: `matcher.onnx` (+ optionally `renderer.onnx` for the
+in-extension ranking) running on CPU. CMA-ES against the real Operator stays a separate
+dev-only polish, not part of the extension.
+
+---
+
+## (History) v1 — diffusion design (2026-06-15)
+
+> Superseded by v2 above. Kept for the reasoning trail.
 
 Built once the pitch-conditioned renderer cleared its gate (+50.3% canonical loud-bin
 gap across the full pitch range). The matcher is `input audio → Operator params`, trained
 with the magnitude-weighted spectral loss backpropped **through the frozen renderer**.
-Code: `src/doppelganger/matcher/` (`model.py`, `diffusion.py`, `train_matcher.py`,
-`match.py`).
 
 ## Why this shape (and why regression failed before)
 

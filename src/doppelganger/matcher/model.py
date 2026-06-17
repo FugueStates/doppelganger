@@ -117,11 +117,16 @@ class Matcher(nn.Module):
         return ((keep - self.man_lo) / span).clamp(0, 1)
 
     def assemble(self, pos: torch.Tensor, algo: torch.Tensor) -> torch.Tensor:
-        """pos [B,dim] in [0,1] -> full [B,195] normalized, mapped into the manifold box."""
+        """pos [B,dim] in [0,1] -> full [B,195] normalized, mapped into the manifold box.
+
+        Built in fp32 regardless of autocast: param values want full precision (they feed
+        the physics' fp64 phase math), and the manifold buffers are fp32, so mixing in a
+        bf16 `pos` under autocast would otherwise dtype-mismatch the index-put."""
+        pos = pos.float()
         B = pos.shape[0]
-        full = torch.zeros(B, len(self.schema.params), device=pos.device, dtype=pos.dtype)
-        full[:, self.keep_idx] = self.man_lo + pos * (self.man_hi - self.man_lo)
-        full[:, self.algo_idx] = algo.to(full.dtype) / max(self.n_algo - 1, 1)
+        full = torch.zeros(B, len(self.schema.params), device=pos.device, dtype=torch.float32)
+        full[:, self.keep_idx] = self.man_lo.float() + pos * (self.man_hi - self.man_lo).float()
+        full[:, self.algo_idx] = algo.float() / max(self.n_algo - 1, 1)
         return full
 
     # --- forward pieces ---------------------------------------------------------

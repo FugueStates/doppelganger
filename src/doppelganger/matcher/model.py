@@ -31,7 +31,8 @@ class MatcherConfig:
     n_fft: int = 1024
     hop: int = 256
     n_mels: int = 128
-    n_bins: int = 32                # K bins per continuous param
+    n_bins: int = 64                # K bins per continuous param (64 → finer envelope
+                                    # precision + less binned-decode edge bias than 32)
     ch: int = 32                    # base CNN width
     emb: int = 512
     # Pool to a freq x TIME grid, NOT a single vector: collapsing time (global avg pool)

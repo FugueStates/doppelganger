@@ -69,12 +69,14 @@ export type Rule =
   | { kind: "forceIndex"; index: number } // quantized -> a specific option
   | { kind: "forceValue"; value: number } // absolute raw value (clamped to [min,max])
   | { kind: "randomChoice"; indices: number[] } // quantized -> random pick from a set
+  | { kind: "randomInt"; lo: number; hi: number } // random integer raw value in [lo,hi]
   | { kind: "fracRange"; lo: number; hi: number }; // sample within a fraction of [min,max]
 
 const forceMax: Rule = { kind: "forceMax" };
 const forceIndex = (index: number): Rule => ({ kind: "forceIndex", index });
 const forceValue = (value: number): Rule => ({ kind: "forceValue", value });
 const randomChoice = (indices: number[]): Rule => ({ kind: "randomChoice", indices });
+const randomInt = (lo: number, hi: number): Rule => ({ kind: "randomInt", lo, hi });
 const frac = (lo: number, hi: number): Rule => ({ kind: "fracRange", lo, hi });
 
 function buildSamplingRules(): Record<string, Rule> {
@@ -152,8 +154,69 @@ function buildSniffRules(): Record<string, Rule> {
   };
 }
 
+/**
+ * Staged dataset expansion (matcher-v3). Each stage adds capability; pick which the
+ * collector generates. Stage 0 (passed): single-osc waveform+ADSR. Stage 1: 2-operator
+ * FM (B->A) — adds the modulator (Osc-B) ratio + level, the core FM controls.
+ */
+export const COLLECTION_STAGE = 1;
+
+/** Stage 1 — 2-operator FM. Carrier A (waveform + amp env, pitch = note) modulated by B
+ *  (sine, varying ratio + level = modulation index, steady envelope). C/D off; the linear
+ *  A<-B chain is algorithm 0 with C/D disabled. Everything else neutral/off. */
+function buildStage1Rules(): Record<string, Rule> {
+  return {
+    "Device On": forceMax,
+    Volume: forceValue(0.8),
+    Algorithm: forceIndex(0), // D>C>B>A chain; with C,D off this is B->A
+    Transpose: forceValue(0),
+    Spread: forceValue(0),
+    "Glide On": forceIndex(0),
+    Panorama: forceValue(0),
+    // carrier A: pitch = note, varying waveform + amp envelope (kept from Stage 0)
+    "Osc-A On": forceMax,
+    "Osc-A Level": forceMax,
+    "Osc-A Wave": randomChoice(SNIFF_WAVEFORMS),
+    "Osc-A Feedb": forceValue(0),
+    "A Fix On ": forceIndex(0),
+    "A Coarse": forceValue(1), // ratio 1 (carrier tracks the note)
+    "A Fine": forceValue(0),
+    "Ae Mode": forceIndex(0),
+    "Ae Init": forceValue(0),
+    "Ae Peak": forceMax,
+    "Ae Attack": frac(0, 1),
+    "Ae Decay": frac(0, 1),
+    "Ae Sustain": frac(0, 1),
+    "Ae Release": frac(0, 1),
+    // modulator B -> A: sine, varying RATIO (Coarse) + LEVEL (modulation index), steady env
+    "Osc-B On": forceMax,
+    "Osc-B Wave": forceIndex(0), // sine (classic FM modulator)
+    "Osc-B Level": frac(0, 1), // modulation index (the key FM brightness control)
+    "B Coarse": randomInt(1, 16), // modulator ratio (categorical integer ratio)
+    "B Fine": forceValue(0),
+    "Osc-B Feedb": forceValue(0),
+    "B Fix On ": forceIndex(0),
+    "Be Mode": forceIndex(0),
+    "Be Init": forceValue(0),
+    "Be Peak": forceMax,
+    "Be Attack": forceValue(0), // steady modulator (constant FM over the note) — Stage 1
+    "Be Decay": forceValue(0),
+    "Be Sustain": forceMax,
+    "Be Release": forceValue(0.1),
+    // C, D off; all timbre-coloring sections off
+    "Osc-C On": forceIndex(0),
+    "Osc-D On": forceIndex(0),
+    "Filter On": forceIndex(0),
+    "LFO On": forceIndex(0),
+    "Pe On": forceIndex(0),
+    "Shaper Mix": forceValue(0),
+    "Shaper Drive": forceValue(0),
+  };
+}
+
 /** Active rule set when SNIFF_MODE; unruled params fall back to their neutral default. */
-export const SNIFF_RULES: Record<string, Rule> = buildSniffRules();
+export const SNIFF_RULES: Record<string, Rule> =
+  COLLECTION_STAGE >= 1 ? buildStage1Rules() : buildSniffRules();
 
 // --- Output paths (absolute on this machine) -------------------------------
 export const REPO_ROOT = "D:/AbletonExtensions/doppelganger";

@@ -49,25 +49,30 @@ def compute_loss(model, out, batch, sigma):
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, sniff_idx):
+def evaluate(model, loader, device, watch):
+    """`watch` = list of (label, 'cat'|'cont', index-or-index-list) — per-param probes
+    (cat -> accuracy, cont -> MAE) on top of the overall masked cont_mae/cat_acc/bin_acc."""
     model.eval()
-    wave_i, adsr_i = sniff_idx
     cont_ae = cont_n = cat_hit = cat_n = bin_hit = bin_n = 0.0
-    wave_hit = wave_n = 0.0
-    adsr_ae = adsr_n = 0.0
+    w_acc = {w[0]: [0.0, 0.0] for w in watch if w[1] == "cat"}
+    w_mae = {w[0]: [0.0, 0.0] for w in watch if w[1] == "cont"}
+    cat_idx = {w[0]: w[2] for w in watch if w[1] == "cat"}
+    cont_idx = {w[0]: (w[2] if isinstance(w[2], list) else [w[2]]) for w in watch if w[1] == "cont"}
     for batch in loader:
         audio, cont, binary, cat, cont_m, bin_m, cat_m = [b.to(device) for b in batch]
-        out = model(audio)
-        pc, pb, pcat = model.decode(out)
+        pc, pb, pcat = model.decode(model(audio))
         cont_ae += ((pc - cont).abs() * cont_m).sum().item(); cont_n += cont_m.sum().item()
         cat_hit += (((pcat == cat).float()) * cat_m).sum().item(); cat_n += cat_m.sum().item()
         bin_hit += ((((pb >= 0.5).float() == binary).float()) * bin_m).sum().item(); bin_n += bin_m.sum().item()
-        # sniff metrics
-        wave_hit += (pcat[:, wave_i] == cat[:, wave_i]).float().sum().item(); wave_n += audio.shape[0]
-        adsr_ae += (pc[:, adsr_i] - cont[:, adsr_i]).abs().sum().item(); adsr_n += audio.shape[0] * len(adsr_i)
-    return dict(wave_acc=wave_hit / max(wave_n, 1), adsr_mae=adsr_ae / max(adsr_n, 1),
-                cont_mae=cont_ae / max(cont_n, 1), cat_acc=cat_hit / max(cat_n, 1),
-                bin_acc=bin_hit / max(bin_n, 1))
+        B = audio.shape[0]
+        for lbl, i in cat_idx.items():
+            w_acc[lbl][0] += (pcat[:, i] == cat[:, i]).float().sum().item(); w_acc[lbl][1] += B
+        for lbl, idxs in cont_idx.items():
+            w_mae[lbl][0] += (pc[:, idxs] - cont[:, idxs]).abs().sum().item(); w_mae[lbl][1] += B * len(idxs)
+    m = {lbl: h / max(n, 1) for lbl, (h, n) in w_acc.items()}
+    m.update({lbl: ae / max(n, 1) for lbl, (ae, n) in w_mae.items()})
+    m.update(cont_mae=cont_ae / max(cont_n, 1), cat_acc=cat_hit / max(cat_n, 1), bin_acc=bin_hit / max(bin_n, 1))
+    return m
 
 
 def main():
@@ -79,7 +84,7 @@ def main():
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
-    ap.add_argument("--bins", type=int, default=32)
+    ap.add_argument("--bins", type=int, default=64, help="bins per continuous param (finer = better envelope precision)")
     ap.add_argument("--sigma", type=float, default=1.5, help="Gaussian soft-label width (bins)")
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
@@ -100,11 +105,16 @@ def main():
     tr_dl = DataLoader(tr, batch_size=args.batch_size, shuffle=True, drop_last=len(tr) > args.batch_size, **dl_kw)
     va_dl = DataLoader(va, batch_size=args.batch_size, **dl_kw)
 
-    # indices for the sniff metrics
+    # per-param probes (whichever exist in this stage's predicted set)
     cont_names = [p.name for p in model.codec.cont]
     cat_names = [p.name for p in model.codec.categorical]
-    wave_i = cat_names.index("Osc-A Wave")
-    adsr_i = [cont_names.index(n) for n in ("Ae Attack", "Ae Decay", "Ae Sustain", "Ae Release")]
+    watch = [("WAVE_ACC", "cat", cat_names.index("Osc-A Wave")),
+             ("ADSR_MAE", "cont", [cont_names.index(n) for n in
+                                   ("Ae Attack", "Ae Decay", "Ae Sustain", "Ae Release")])]
+    if "B Coarse" in cat_names:        # Stage 1+: modulator ratio (the categorical ratio head)
+        watch.append(("RATIO_ACC", "cat", cat_names.index("B Coarse")))
+    if "Osc-B Level" in cont_names:    # Stage 1+: FM modulation index
+        watch.append(("MODIDX_MAE", "cont", [cont_names.index("Osc-B Level")]))
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -127,13 +137,15 @@ def main():
             nb += 1
         sched.step()
         if epoch % args.eval_every == 0 or epoch == args.epochs:
-            m = evaluate(model, va_dl, device, (wave_i, adsr_i))
-            score = m["wave_acc"] - m["adsr_mae"]  # the sniff gate, higher is better
+            m = evaluate(model, va_dl, device, watch)
+            # gate score: reward the watched accuracies, penalize the watched errors
+            score = (sum(m[w[0]] for w in watch if w[1] == "cat")
+                     - sum(m[w[0]] for w in watch if w[1] == "cont"))
             improved = score > best
+            probes = " ".join(f"{w[0]}={m[w[0]]:.3f}" for w in watch)
             print(f"epoch {epoch:3} | train cont={agg[0]/nb:.3f} bin={agg[1]/nb:.3f} cat={agg[2]/nb:.3f} "
-                  f"| WAVE_ACC={m['wave_acc']:.3f} ADSR_MAE={m['adsr_mae']:.3f} "
-                  f"| cont_mae={m['cont_mae']:.3f} cat_acc={m['cat_acc']:.3f} bin_acc={m['bin_acc']:.3f}"
-                  f"{'  <- best' if improved else ''}")
+                  f"| {probes} | cont_mae={m['cont_mae']:.3f} cat_acc={m['cat_acc']:.3f} "
+                  f"bin_acc={m['bin_acc']:.3f}{'  <- best' if improved else ''}")
             if improved:
                 best = score
                 torch.save({"state_dict": model.state_dict(), "cfg": cfg.__dict__,

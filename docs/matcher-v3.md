@@ -121,12 +121,59 @@ waveform + envelope at all? If not, nothing else matters.
 **Verdict:** the foundation is sound — the formulation learns spectral (waveform) and
 temporal (envelope) params with honest metrics. Cleared to expand.
 
-### Stage 1 — (next) 2-operator FM (B→A)
-Enable Osc-B as a modulator of Osc-A (the start of the linear chain). Carrier A pinned to
-the note; Fine dropped everywhere. Modulator ratio (B Coarse) is IN as a **categorical
-integer-ratio head** — restores FM's core timbre control and fixes the Coarse decode bug
-from Stage 0. Everything from the Out-of-scope list stays neutral. Watch for the next flaw. (Then: 3- and 4-op chains → filter → feedback → …, adding
-the perceptual per-param loss weighting once the space is large.)
+### Stage 1 — 2-operator FM (B→A) 🔵 BUILT, awaiting data (2026-06-17)
+Enable Osc-B as a sine modulator of carrier Osc-A (algorithm 0 with C/D off = B→A).
+**Data** (`COLLECTION_STAGE=1` in config.ts): carrier A varies waveform + amp ADSR (pitch
+pinned to the note); modulator B varies **ratio (B Coarse, integer 1–16)** and **level
+(= modulation index)** with a steady envelope; everything else neutral. **Model/codec:**
+- **Categorical integer-ratio head.** All Coarse params (A/B/C/D) moved from binned-continuous
+  to categorical over integer ratios (ratio = `floor(Coarse)`). Confirmed: A Coarse now
+  decodes to **exactly 1.0** (carrier on-pitch) vs the old ~2.2 octave error; B's ratio is a
+  learnable class. Restores FM's core timbre lever *and* fixes the Stage-0 decode bug.
+- **Frozen params.** Fine (all) + oscillator Feedback (all) pinned to 0 and *not* predicted
+  (no head/loss, set at decode) — they sit at a range edge where binned decode is biased and
+  aren't gated inaudible. Confirmed Fine/Feedb decode to 0.
+- **New eval probes:** `RATIO_ACC` (B Coarse class accuracy) + `MODIDX_MAE` (Osc-B Level),
+  alongside `WAVE_ACC` / `ADSR_MAE`.
+
+Gate: on Stage-1 data, learn the FM ratio (RATIO_ACC → high) + modulation index
+(MODIDX_MAE → low) while keeping waveform + envelope; then hear it. Code smoke-tested on the
+Stage-0 set (runs; waveform stays 1.000; A Coarse exact; Fine frozen) — RATIO/MODIDX become
+meaningful only once Stage-1 data (Osc-B on) is collected.
+
+**Stage 1 RESULT ✅ PASSED (2026-06-17, 568 samples).** Best ckpt (epoch 25): WAVE_ACC 0.95,
+ADSR_MAE 0.14, MODIDX_MAE 0.11, RATIO_ACC 0.69. Carrier pitch is now correct (A Coarse exact).
+- **Finding #3 — FM ratio observability ∝ modulation index.** Raw RATIO_ACC 0.62 is misleading:
+  split by modulator level, accuracy is **0.25 (idx<0.2) / 0.61 / 0.89 (idx>0.5)**. When the
+  FM is audible the integer ratio is identified ~89%; the misses are low-index samples where
+  the ratio is physically unobservable (and perceptually irrelevant) — the same identifiability
+  lesson as ADSR sustain. *This is the concrete motivation for the deferred perceptual per-param
+  weighting: weight the ratio loss/metric by the modulation index (how much it matters).*
+- **Overfitting** on ~500 samples (val ratio peaks ~epoch 25 then declines as train→0) — more
+  data + early stop. Best-ckpt saving already keeps the peak.
+- Waveform/ADSR degraded slightly vs Stage 0 (sidebands obscure the carrier) — acceptable.
+
+**Stage 1 — pitch fixes + final (2026-06-17): SOUNDS "extremely close" by ear ✅.**
+- **Finding #4 — out-of-scope *pitch* params must be frozen, not predicted.** A param diff on
+  a match showed Transpose decoding to −0.054 (~5 cents flat) — audible. Transpose + per-osc
+  `Freq<Vel` are pinned out-of-scope pitch params; added them to the codec `FROZEN_DEFAULT`
+  (now: Fine, Feedback, Transpose, Freq<Vel) so carrier pitch is *exactly* the played note.
+  (Also confirmed the FM ratio was already correct — an apparent ratio error was a stale
+  manifest, not the model.)
+- Bumped bins **32 → 64** (config + train `--bins` default): cont_mae 0.022 → **0.014**, finer
+  envelopes, less edge bias. Retrained: pitch clean, sounds extremely close.
+
+### Stage 2 — (next) 3-operator FM (C→B→A)
+Enable Osc-C as a modulator of B (linear chain C→B→A; A carrier, B+C modulators). Should be
+mostly a **data-mode change** (the codec/model already handle all 4 oscillators' ratios,
+levels, envelopes via gating) — enable C with varying ratio + level. Two things to fold in
+here, where they start to matter (2 modulator ratios, more low-index/unobservable cases):
+- **Perceptual per-param weighting** (Sound2Synth): weight the ratio loss + RATIO_ACC by the
+  modulation index, so the model isn't trained/graded on ratios the sound doesn't expose.
+- **More data** to close the overfitting seen on ~500 samples.
+
+### Later stages
+4-op chain → filter → feedback → …
 
 ## Open levers (when needed)
 - Per-param perceptual loss weighting (Sound2Synth, via `sensitivity.py`).

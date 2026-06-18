@@ -84,6 +84,11 @@ function chooseValue(param: DeviceParameter<ApiVersion>): number {
       const pick = rule.indices[Math.floor(Math.random() * rule.indices.length)]!;
       return Math.min(nOpts - 1, Math.max(0, pick));
     }
+    if (rule.kind === "randomInt") {
+      const lo = Math.max(param.min, rule.lo);
+      const hi = Math.min(param.max, rule.hi);
+      return lo + Math.floor(Math.random() * (hi - lo + 1));
+    }
     // fracRange: sample within a fraction of the full range
     const frac = rule.lo + Math.random() * (rule.hi - rule.lo);
     const value = param.min + frac * span;

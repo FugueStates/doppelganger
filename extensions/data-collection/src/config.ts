@@ -159,7 +159,7 @@ function buildSniffRules(): Record<string, Rule> {
  * collector generates. Stage 0 (passed): single-osc waveform+ADSR. Stage 1: 2-operator
  * FM (B->A) — adds the modulator (Osc-B) ratio + level, the core FM controls.
  */
-export const COLLECTION_STAGE = 1;
+export const COLLECTION_STAGE: number = 2;
 
 /** Stage 1 — 2-operator FM. Carrier A (waveform + amp env, pitch = note) modulated by B
  *  (sine, varying ratio + level = modulation index, steady envelope). C/D off; the linear
@@ -214,9 +214,74 @@ function buildStage1Rules(): Record<string, Rule> {
   };
 }
 
+/** Stage 2 — 3-operator FM, PARALLEL modulators (B→A and C→A). All oscillators ON; PRESENCE
+ *  is controlled by LEVEL (level 0 = silent), not the On toggle. Carrier A (waveform + amp
+ *  env, pitch = note); modulators B and C (sine, varying ratio + level, steady env) each
+ *  modulate the carrier DIRECTLY — algorithm 7 (D>A, C>A, B>A) with D's level = 0.
+ *  (Pivoted from the serial chain C→B→A / algo 0: a deep serial chain entangles the
+ *  operators and is hard to invert — see docs/matcher-v3.md Finding #6. Parallel modulators
+ *  put each operator's sidebands directly on the carrier → far more separable, and each
+ *  operator's effect depends only on its own level, so the own-level weighting is exact.)
+ *  Mixing C's level toward 0 makes a sample effectively 2-op, so the set spans 2–3 ops. */
+function buildStage2Rules(): Record<string, Rule> {
+  const carrierAndGlobals: Record<string, Rule> = {
+    "Device On": forceMax,
+    Volume: forceValue(0.8),
+    Algorithm: forceIndex(6), // algo 7: D>A, C>A, B>A (parallel modulators on carrier A)
+    Transpose: forceValue(0),
+    Spread: forceValue(0),
+    "Glide On": forceIndex(0),
+    Panorama: forceValue(0),
+    // every oscillator ON — presence is set by level, not the toggle
+    "Osc-A On": forceMax,
+    "Osc-B On": forceMax,
+    "Osc-C On": forceMax,
+    "Osc-D On": forceMax,
+    // carrier A
+    "Osc-A Level": forceMax,
+    "Osc-A Wave": randomChoice(SNIFF_WAVEFORMS),
+    "Osc-A Feedb": forceValue(0),
+    "A Fix On ": forceIndex(0),
+    "A Coarse": forceValue(1),
+    "A Fine": forceValue(0),
+    "Ae Mode": forceIndex(0),
+    "Ae Init": forceValue(0),
+    "Ae Peak": forceMax,
+    "Ae Attack": frac(0, 1),
+    "Ae Decay": frac(0, 1),
+    "Ae Sustain": frac(0, 1),
+    "Ae Release": frac(0, 1),
+    "Osc-D Level": forceValue(0), // D disabled via level (so the chain is C→B→A)
+    "Filter On": forceIndex(0),
+    "LFO On": forceIndex(0),
+    "Pe On": forceIndex(0),
+    "Shaper Mix": forceValue(0),
+    "Shaper Drive": forceValue(0),
+  };
+  // a sine modulator with varying ratio + level (= FM index) and a steady envelope
+  const modulator = (X: string, e: string): Record<string, Rule> => ({
+    [`Osc-${X} Wave`]: forceIndex(0), // sine
+    [`Osc-${X} Level`]: frac(0, 1), // modulation index (0 ⇒ this operator is effectively off)
+    [`${X} Coarse`]: randomInt(1, 16), // ratio (categorical)
+    [`${X} Fine`]: forceValue(0),
+    [`Osc-${X} Feedb`]: forceValue(0),
+    [`${X} Fix On `]: forceIndex(0),
+    [`${e} Mode`]: forceIndex(0),
+    [`${e} Init`]: forceValue(0),
+    [`${e} Peak`]: forceMax,
+    [`${e} Attack`]: forceValue(0),
+    [`${e} Decay`]: forceValue(0),
+    [`${e} Sustain`]: forceMax,
+    [`${e} Release`]: forceValue(0.1),
+  });
+  return { ...carrierAndGlobals, ...modulator("B", "Be"), ...modulator("C", "Ce") };
+}
+
 /** Active rule set when SNIFF_MODE; unruled params fall back to their neutral default. */
 export const SNIFF_RULES: Record<string, Rule> =
-  COLLECTION_STAGE >= 1 ? buildStage1Rules() : buildSniffRules();
+  COLLECTION_STAGE >= 2 ? buildStage2Rules()
+    : COLLECTION_STAGE === 1 ? buildStage1Rules()
+    : buildSniffRules();
 
 // --- Output paths (absolute on this machine) -------------------------------
 export const REPO_ROOT = "D:/AbletonExtensions/doppelganger";

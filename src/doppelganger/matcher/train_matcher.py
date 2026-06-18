@@ -64,11 +64,17 @@ def evaluate(model, loader, device, watch):
         cont_ae += ((pc - cont).abs() * cont_m).sum().item(); cont_n += cont_m.sum().item()
         cat_hit += (((pcat == cat).float()) * cat_m).sum().item(); cat_n += cat_m.sum().item()
         bin_hit += ((((pb >= 0.5).float() == binary).float()) * bin_m).sum().item(); bin_n += bin_m.sum().item()
-        B = audio.shape[0]
+        # weight each probe by its gate weight (= controlling osc level) so the metric
+        # reflects audible cases — e.g. RATIO_ACC counts ratios where the modulator is heard,
+        # not the low-index samples where the ratio is unobservable.
         for lbl, i in cat_idx.items():
-            w_acc[lbl][0] += (pcat[:, i] == cat[:, i]).float().sum().item(); w_acc[lbl][1] += B
+            wgt = cat_m[:, i]
+            w_acc[lbl][0] += ((pcat[:, i] == cat[:, i]).float() * wgt).sum().item()
+            w_acc[lbl][1] += wgt.sum().item()
         for lbl, idxs in cont_idx.items():
-            w_mae[lbl][0] += (pc[:, idxs] - cont[:, idxs]).abs().sum().item(); w_mae[lbl][1] += B * len(idxs)
+            wgt = cont_m[:, idxs]
+            w_mae[lbl][0] += ((pc[:, idxs] - cont[:, idxs]).abs() * wgt).sum().item()
+            w_mae[lbl][1] += wgt.sum().item()
     m = {lbl: h / max(n, 1) for lbl, (h, n) in w_acc.items()}
     m.update({lbl: ae / max(n, 1) for lbl, (ae, n) in w_mae.items()})
     m.update(cont_mae=cont_ae / max(cont_n, 1), cat_acc=cat_hit / max(cat_n, 1), bin_acc=bin_hit / max(bin_n, 1))
@@ -111,10 +117,11 @@ def main():
     watch = [("WAVE_ACC", "cat", cat_names.index("Osc-A Wave")),
              ("ADSR_MAE", "cont", [cont_names.index(n) for n in
                                    ("Ae Attack", "Ae Decay", "Ae Sustain", "Ae Release")])]
-    if "B Coarse" in cat_names:        # Stage 1+: modulator ratio (the categorical ratio head)
-        watch.append(("RATIO_ACC", "cat", cat_names.index("B Coarse")))
-    if "Osc-B Level" in cont_names:    # Stage 1+: FM modulation index
-        watch.append(("MODIDX_MAE", "cont", [cont_names.index("Osc-B Level")]))
+    for X in "BCD":                    # each active modulator's ratio + level (index-weighted)
+        if f"{X} Coarse" in cat_names:
+            watch.append((f"RATIO_{X}", "cat", cat_names.index(f"{X} Coarse")))
+        if f"Osc-{X} Level" in cont_names:
+            watch.append((f"IDX_{X}", "cont", [cont_names.index(f"Osc-{X} Level")]))
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)

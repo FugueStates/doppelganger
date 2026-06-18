@@ -63,8 +63,10 @@ Deliberately narrow the synthesis space to what's learnable + expressive, expand
 - **Routing: the fixed linear chain D→C→B→A only** (the 11 algorithms are dropped → the
   weak Algorithm classifier is removed). **Complexity is controlled by how many oscillators
   are enabled** (1 = pure carrier, 2 = B→A FM, 3 = C→B→A, 4 = full chain).
-- Per oscillator: **On/Off, Level** (carrier level / FM modulation index), **ADSR envelope**,
-  **Waveform** (kept — sniff-validated, cheap, expressive).
+- Per oscillator: **Level** (carrier level / FM modulation index — also controls oscillator
+  *presence*: level 0 = silent), **ADSR envelope**, **Waveform** (kept — sniff-validated).
+  The **On/Off toggles are pinned ON and not predicted** (decided Stage 2) — presence is set
+  by level, so there's no separate discrete on/off to get wrong.
 - **Modulator frequency ratio (B/C/D Coarse): IN ✅ (decided 2026-06-17).** Implemented as a
   **categorical integer-ratio head** (ratio = `floor(Coarse)`). It's FM's primary timbre
   control — the harmonic vs inharmonic/bell/metallic character — so it's essential to sound
@@ -163,17 +165,75 @@ ADSR_MAE 0.14, MODIDX_MAE 0.11, RATIO_ACC 0.69. Carrier pitch is now correct (A 
 - Bumped bins **32 → 64** (config + train `--bins` default): cont_mae 0.022 → **0.014**, finer
   envelopes, less edge bias. Retrained: pitch clean, sounds extremely close.
 
-### Stage 2 — (next) 3-operator FM (C→B→A)
-Enable Osc-C as a modulator of B (linear chain C→B→A; A carrier, B+C modulators). Should be
-mostly a **data-mode change** (the codec/model already handle all 4 oscillators' ratios,
-levels, envelopes via gating) — enable C with varying ratio + level. Two things to fold in
-here, where they start to matter (2 modulator ratios, more low-index/unobservable cases):
-- **Perceptual per-param weighting** (Sound2Synth): weight the ratio loss + RATIO_ACC by the
-  modulation index, so the model isn't trained/graded on ratios the sound doesn't expose.
-- **More data** to close the overfitting seen on ~500 samples.
+### Stage 2 — 3-operator FM (C→B→A) 🔵 BUILT, awaiting data (2026-06-17)
+Add Osc-C as a modulator of B (chain C→B→A; A carrier, B+C sine modulators, D off). Data
+(`COLLECTION_STAGE=2`): all oscillators ON; carrier A varies waveform + amp ADSR; B and C
+vary **ratio + level (= modulation index)**, steady envelopes; D's level = 0. Because C's
+level spans 0→1, the set naturally mixes 2-op and 3-op patches.
+
+- **Finding #5 — control presence by LEVEL, gate/weight by LEVEL (the perceptual-weighting
+  unlock).** A modulator at level 0 contributes nothing, so the On toggles are redundant:
+  pinned ON + frozen (one fewer discrete prediction). Gating switched from "Osc-X On < 0.5"
+  to a **continuous weight = Osc-X Level** (0..1): each oscillator's params (ratio, envelope,
+  waveform) are supervised — and the eval probes weighted — *in proportion to how much the
+  oscillator is heard*. This is exactly the deferred Sound2Synth per-param perceptual
+  weighting, and it makes RATIO_ACC honest (counts ratios where the modulator is audible,
+  not the low-index don't-cares from Finding #3). Smoke-tested: gate(B Coarse)=Osc-B Level,
+  On frozen to 1, probes RATIO_B/C/D + IDX_B/C/D.
+- **More data** still wanted to close the ~500-sample overfitting.
+
+Gate: on Stage-2 data, learn B *and* C ratios (index-weighted RATIO_B / RATIO_C → high) +
+both indices while keeping waveform/envelope; then hear a 3-op patch.
+
+**Stage 2 RESULT ⚠ REGRESSION — deep serial FM is hard to invert (2026-06-17, 694 samples).**
+WAVE_ACC 0.84, ADSR 0.13, IDX_B 0.07 (fine), but **RATIO_B fell 0.66 → ~0.35** and
+**RATIO_C ~0.13, IDX_C ~0.24 (poor)**. Diagnostic by audibility (unlike Stage 1, this is NOT
+a metric artifact): RATIO_B *when B is loud* = 0.43 (was ~0.89 in 2-op); RATIO_C *when chain
+weight C_lvl·B_lvl > 0.3* = 0.19 (no better than low-chain) — i.e. C's ratio is genuinely
+unreadable even when audible.
+- **Finding #6 — chain depth breaks FM inversion.** (a) A deeper modulator obscures the
+  shallower one: C FM-ing B means B is no longer a clean sine, so B's own ratio is muddied
+  (B regressed). (b) FM-of-FM is an ill-posed inverse — a doubly-nested spectrum doesn't
+  factor into separate (ratio, level) pairs (many-to-one worsens with depth). This is the
+  documented "deep DX7-class FM is the hard case," quantified.
+- **Implications / options:** 2-op is the clean sweet spot. (1) **Hear it** — FM is forgiving;
+  the sound may still approximate acceptably even with C's ratio often wrong. (2) **Topology
+  rethink: parallel modulators** (B→A *and* C→A, e.g. algorithm 7) instead of a serial chain
+  — sidebands land directly on the carrier → far more separable/identifiable, and own-level
+  weighting becomes exactly correct. "Complexity = # operators" as more *parallel* modulators,
+  not a deeper chain. (3) chain-aware weighting (C by C_lvl·B_lvl) + more data — correctness
+  improvements but won't fix the core difficulty alone. *Decision pending: serial vs parallel,
+  after hearing.*
+
+**Stage 2 PIVOT → PARALLEL modulators (2026-06-17).** Heard the 3-op serial match (0000050):
+audibly looser than 2-op, as the curve predicted. Switched the topology: extra operators now
+modulate the carrier **in parallel** (B→A *and* C→A, algorithm 7) instead of a serial chain.
+Only the collector changed (Algorithm 0 → 6); codec/model/weighting unchanged because each
+parallel modulator's effect depends only on its own level (the own-level weighting is already
+exact). Rationale: parallel puts each operator's sidebands directly on the carrier → far more
+separable than nested serial FM. "Complexity = # operators" now means more *parallel*
+modulators on the carrier, not a deeper chain. Serial chains may return later as an explicit
+hard mode. NEXT: collect fresh parallel 3-op data, retrain, compare RATIO_B/RATIO_C vs the
+serial run, hear it.
+
+**Finding #7 — parallel modulators are a permutation-symmetric SET; canonicalize the labels
+(2026-06-17).** With B→A, C→A, D→A, swapping two modulators gives *identical* audio (FM
+modulation sums commutatively into the carrier), but the per-slot supervised loss compares
+against the arbitrary ground-truth slot assignment — so the model was fed **contradictory
+targets** (same spectrogram, different "correct" labels across samples) and learned a hedged,
+blurry predictor. Diagnostic on the parallel model: per-slot ratio acc 0.33 vs
+permutation-invariant (set-matched) 0.38 — permutation directly explains ~5 pts, but the
+deeper damage is to *training*. **Fix:** `codec._canonicalize` sorts the symmetric modulators
+(B/C/D) by level (dominant first, ratio tiebreak) before encoding, so each sound maps to ONE
+labeling. Audio unchanged; loss well-posed; pairs with level-gating so the dominant modulator
+lands in the high-weight slot. Reuses existing data (re-encoding only). RATIO_B = the dominant
+modulator's ratio (should rise); judge the real gain by whether permutation-invariant set
+accuracy climbs above 0.38 after retrain. (Also explains "sounds close despite low ratio acc":
+the model nails the big perceptual factors + the dominant modulator; secondary ratios are
+finer/often interchangeable.)
 
 ### Later stages
-4-op chain → filter → feedback → …
+4-op (more parallel modulators) → filter → feedback → …
 
 ## Open levers (when needed)
 - Per-param perceptual loss weighting (Sound2Synth, via `sensitivity.py`).

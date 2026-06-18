@@ -16,8 +16,14 @@ Output head kinds:
                  be audibly wrong at a range edge yet aren't gated inaudible (Fine detune,
                  oscillator feedback). Keeps the predicted preset clean.
 
-GATING: an oscillator's params are inaudible when it's OFF; `encode` returns a 0/1 mask per
-param so the loss/metrics ignore masked params (also dampens the many-to-one problem).
+GATING (now LEVEL-based + continuous = perceptual weighting): an oscillator's params matter
+in proportion to how much it's heard, i.e. its output/modulation LEVEL. `encode` returns a
+per-param WEIGHT = the controlling oscillator's level (0..1); the loss/metrics weight each
+param by it. A modulator at level 0 contributes nothing (FM index 0), so its ratio/envelope
+get weight 0 (= old hard gate); a half-level modulator gets half weight. This both lets us
+control oscillator presence by level alone (the On toggles are frozen on) and focuses
+supervision where the sound actually is (the Sound2Synth perceptual-weighting idea, and the
+fix for the misleading raw ratio accuracy at low modulation index).
 """
 
 from __future__ import annotations
@@ -45,6 +51,10 @@ FROZEN_DEFAULT: dict[str, float] = {
     **{f"Osc-{X} Feedb": 0.0 for X in "ABCD"},
     "Transpose": 0.0,
     **{f"{X} Freq<Vel": 0.0 for X in "ABCD"},
+    # Oscillator On toggles pinned ON: oscillator PRESENCE is controlled by level (level 0
+    # = silent), so we don't predict the toggles — one fewer discrete decision, and it makes
+    # level the single knob for "how many operators" (decided 2026-06-17).
+    **{f"Osc-{X} On": 1.0 for X in "ABCD"},
 }
 
 
@@ -55,11 +65,22 @@ def _oscillator_of(name: str) -> str | None:
     return None
 
 
+def _remap_osc(name: str, src: str, dst: str) -> str:
+    """Rename a param of oscillator `src` to the corresponding param of oscillator `dst`."""
+    for pre in (f"Osc-{src}", f"{src}e ", f"{src} "):
+        if name.startswith(pre):
+            return {f"Osc-{src}": f"Osc-{dst}", f"{src}e ": f"{dst}e ",
+                    f"{src} ": f"{dst} "}[pre] + name[len(pre):]
+    return name
+
+
 def _gate_of(name: str) -> str | None:
+    """The oscillator LEVEL that gates/weights this param's audibility (None if ungated).
+    A param of oscillator X is weighted by Osc-X Level; the level itself is never gated."""
     o = _oscillator_of(name)
     if o is None:
         return None
-    gate = f"Osc-{o} On"
+    gate = f"Osc-{o} Level"
     return None if name == gate else gate
 
 
@@ -68,7 +89,7 @@ class EncodedTargets:
     cont: np.ndarray
     binary: np.ndarray
     cat: np.ndarray        # int64 [n_cat] class indices (incl. ratio params at the end)
-    cont_mask: np.ndarray
+    cont_mask: np.ndarray  # float32 weight per param (= controlling osc level, 0..1; 1 ungated)
     binary_mask: np.ndarray
     cat_mask: np.ndarray
 
@@ -76,10 +97,16 @@ class EncodedTargets:
 class ParamCodec:
     def __init__(self, schema: OperatorSchema, n_bins: int = 32,
                  frozen: dict[str, float] | None = None,
-                 ratio_params: tuple[str, ...] = RATIO_PARAMS, n_ratio: int = N_RATIO):
+                 ratio_params: tuple[str, ...] = RATIO_PARAMS, n_ratio: int = N_RATIO,
+                 symmetric_mods: tuple[str, ...] = ("B", "C", "D")):
         self.schema = schema
         self.n_bins = n_bins
         self.n_ratio = n_ratio
+        # The parallel modulators (B/C/D → A) are an UNORDERED set: swapping two of them gives
+        # identical audio, so the slot labels are arbitrary. Canonicalize by sorting them
+        # (dominant level first) before encoding, so each sound maps to ONE labeling — removes
+        # the permutation ambiguity that otherwise feeds the model contradictory targets.
+        self.symmetric_mods = symmetric_mods
         self.frozen = dict(FROZEN_DEFAULT if frozen is None else frozen)
         by = {p.name: p for p in schema.params}
         froz = set(self.frozen)
@@ -111,8 +138,11 @@ class ParamCodec:
                 for p, r in zip(self.categorical, self.cat_is_ratio)]
 
     @staticmethod
-    def _mask(gates, params) -> np.ndarray:
-        return np.array([0.0 if (g is not None and params.get(g, 1.0) < 0.5) else 1.0
+    def _weight(gates, params) -> np.ndarray:
+        """Per-param weight = controlling oscillator's level (0..1), 1.0 if ungated.
+        Continuous gate: level 0 -> weight 0 (params unsupervised, osc inaudible); level 1
+        -> full supervision. This is the perceptual weighting."""
+        return np.array([1.0 if g is None else min(1.0, max(0.0, float(params.get(g, 1.0))))
                          for g in gates], dtype=np.float32)
 
     def _cat_class(self, p: Param, is_ratio: bool, params: dict) -> int:
@@ -121,15 +151,35 @@ class ParamCodec:
             return int(min(self.n_ratio - 1, max(0, math.floor(v))))   # ratio = floor(Coarse)
         return int(p.normalize(v))                                     # categorical index
 
+    def _canonicalize(self, params: dict) -> dict:
+        """Reorder the symmetric modulator slots by (level desc, ratio) so the labeling is
+        unique. Audio is unchanged (parallel modulators sum commutatively into the carrier)."""
+        mods = [X for X in self.symmetric_mods]
+        if len(mods) < 2:
+            return params
+        order = sorted(mods, key=lambda X: (-float(params.get(f"Osc-{X} Level", 0.0)),
+                                            math.floor(float(params.get(f"{X} Coarse", 0.0)))))
+        if order == mods:
+            return params
+        new = dict(params)
+        for dst, src in zip(mods, order):           # slot dst receives oscillator src's params
+            if dst == src:
+                continue
+            for name, val in params.items():
+                if _oscillator_of(name) == src:
+                    new[_remap_osc(name, src, dst)] = val
+        return new
+
     def encode(self, params: dict) -> EncodedTargets:
+        params = self._canonicalize(params)
         cont = np.array([p.normalize(params.get(p.name, p.default)) for p in self.cont], dtype=np.float32)
         binary = np.array([p.normalize(params.get(p.name, p.default)) for p in self.binary], dtype=np.float32)
         cat = np.array([self._cat_class(p, r, params)
                         for p, r in zip(self.categorical, self.cat_is_ratio)], dtype=np.int64)
         return EncodedTargets(cont, binary, cat,
-                              self._mask(self.cont_gates, params),
-                              self._mask(self.binary_gates, params),
-                              self._mask(self.cat_gates, params))
+                              self._weight(self.cont_gates, params),
+                              self._weight(self.binary_gates, params),
+                              self._weight(self.cat_gates, params))
 
     def decode(self, cont, binary, cat_indices) -> dict:
         out: dict[str, float] = {}

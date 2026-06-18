@@ -42,11 +42,13 @@ def run(
     idle_timeout: float,
     min_rms: float,
     keep_source: bool = False,
+    out_dir: str | Path | None = None,
 ) -> None:
     pending = Path(pending_dir)
     total_written = 0
     last_activity = time.time()
-    print(f"Watching {pending} … (Ctrl+C to stop)")
+    dest = Path(out_dir) if out_dir else "dataset/operator (default)"
+    print(f"Watching {pending} … -> {dest}  (Ctrl+C to stop)")
 
     while True:
         batch = _next_ready_batch(pending)
@@ -61,7 +63,7 @@ def run(
         try:
             export_batch(batch, expected_count=num_tracks)
             written, skipped = process_pending(
-                batch, min_rms=min_rms, delete_source=not keep_source
+                batch, out_dir=out_dir, min_rms=min_rms, delete_source=not keep_source
             )
             total_written += written
             print(f"=== {batch.name}: +{written} (skipped {skipped}); total={total_written} ===")
@@ -76,7 +78,11 @@ def run(
 def main() -> None:
     repo_root = Path(__file__).resolve().parents[3]
     ap = argparse.ArgumentParser(description="Unattended Ableton data-collection watcher.")
-    ap.add_argument("--pending", default=str(repo_root / "dataset" / "pending"))
+    ap.add_argument("--pending", default=str(repo_root / "dataset" / "pending"),
+                    help="handshake dir the extension writes batches to (matches config.ts PENDING_DIR)")
+    ap.add_argument("--out", default=None,
+                    help="output dataset dir for processed (audio,params) pairs "
+                         "(default: dataset/operator). Use e.g. dataset/sniff to keep a set separate.")
     ap.add_argument("--num-tracks", type=int, default=64, help="files to wait for per export")
     ap.add_argument("--idle-timeout", type=float, default=90.0, help="exit after this idle gap (s)")
     ap.add_argument("--min-rms", type=float, default=0.01)
@@ -86,7 +92,7 @@ def main() -> None:
         help="keep raw exported WAVs in pending/ (default: delete after copying to dataset)",
     )
     args = ap.parse_args()
-    run(args.pending, args.num_tracks, args.idle_timeout, args.min_rms, args.keep_source)
+    run(args.pending, args.num_tracks, args.idle_timeout, args.min_rms, args.keep_source, args.out)
 
 
 if __name__ == "__main__":

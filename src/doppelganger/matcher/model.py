@@ -34,12 +34,19 @@ class MatcherConfig:
     n_bins: int = 32                # K bins per continuous param
     ch: int = 32                    # base CNN width
     emb: int = 512
+    # Pool to a freq x TIME grid, NOT a single vector: collapsing time (global avg pool)
+    # discards exactly the temporal information the ADSR envelope lives in, so the model
+    # could learn the (spectral) waveform but not the (temporal) envelope. Keeping a coarse
+    # time axis lets the param heads read attack/decay/sustain/release.
+    pool_f: int = 4
+    pool_t: int = 16
 
 
 class ConvEncoder(nn.Module):
-    """log-mel [B,1,M,T] -> [B, emb]. Strided 2-D CNN + global average pool."""
+    """log-mel [B,1,M,T] -> [B, emb]. Strided 2-D CNN, then pool to a freq x TIME grid
+    (keeping the time axis so the envelope is readable) and project."""
 
-    def __init__(self, ch: int, emb: int):
+    def __init__(self, ch: int, emb: int, pool_f: int, pool_t: int):
         super().__init__()
         c = [1, ch, ch * 2, ch * 4, ch * 8]
         layers = []
@@ -47,8 +54,8 @@ class ConvEncoder(nn.Module):
             layers += [nn.Conv2d(c[i], c[i + 1], 3, stride=2, padding=1),
                        nn.GroupNorm(8, c[i + 1]), nn.GELU()]
         self.net = nn.Sequential(*layers)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = nn.Sequential(nn.Linear(c[-1], emb), nn.GELU())
+        self.pool = nn.AdaptiveAvgPool2d((pool_f, pool_t))   # collapse freq coarsely, KEEP time
+        self.proj = nn.Sequential(nn.Linear(c[-1] * pool_f * pool_t, emb), nn.GELU())
 
     def forward(self, x):
         return self.proj(self.pool(self.net(x)).flatten(1))
@@ -61,7 +68,7 @@ class ParamMatcher(nn.Module):
         c = self.cfg
         self.codec = ParamCodec(schema, c.n_bins)
         self.logmel = LogMel(c.sample_rate, c.n_fft, c.hop, c.n_mels)
-        self.encoder = ConvEncoder(c.ch, c.emb)
+        self.encoder = ConvEncoder(c.ch, c.emb, c.pool_f, c.pool_t)
 
         self.n_cont = self.codec.n_cont
         self.n_binary = self.codec.n_binary

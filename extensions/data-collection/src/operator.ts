@@ -26,6 +26,8 @@ import {
   VELOCITY_MIN,
   VELOCITY_MAX,
   SAMPLING_RULES,
+  SNIFF_MODE,
+  SNIFF_RULES,
 } from "./config.js";
 
 type Ctx = ReturnType<typeof initialize>;
@@ -66,16 +68,21 @@ export async function buildRack(context: Ctx, count: number): Promise<number> {
   return findOperatorTracks(context).length;
 }
 
-/** Picks a value for one parameter, applying any audibility rule, else full random. */
+/** Picks a value for one parameter. In SNIFF_MODE uses SNIFF_RULES and defaults unruled
+ *  params to their neutral default; otherwise uses SAMPLING_RULES and full-random. */
 function chooseValue(param: DeviceParameter<ApiVersion>): number {
-  const rule = SAMPLING_RULES[param.name];
+  const rules = SNIFF_MODE ? SNIFF_RULES : SAMPLING_RULES;
+  const rule = rules[param.name];
   const span = param.max - param.min;
+  const nOpts = param.valueItems.length || 1;
 
   if (rule) {
     if (rule.kind === "forceMax") return param.max;
-    if (rule.kind === "forceIndex") {
-      const n = param.valueItems.length || 1;
-      return Math.min(n - 1, Math.max(0, rule.index));
+    if (rule.kind === "forceIndex") return Math.min(nOpts - 1, Math.max(0, rule.index));
+    if (rule.kind === "forceValue") return Math.min(param.max, Math.max(param.min, rule.value));
+    if (rule.kind === "randomChoice") {
+      const pick = rule.indices[Math.floor(Math.random() * rule.indices.length)]!;
+      return Math.min(nOpts - 1, Math.max(0, pick));
     }
     // fracRange: sample within a fraction of the full range
     const frac = rule.lo + Math.random() * (rule.hi - rule.lo);
@@ -83,10 +90,11 @@ function chooseValue(param: DeviceParameter<ApiVersion>): number {
     return param.isQuantized ? Math.round(value) : value;
   }
 
-  // No rule -> fully random (timbral params).
-  if (param.isQuantized) {
-    return Math.floor(Math.random() * param.valueItems.length);
-  }
+  // SNIFF_MODE: every unruled param stays at its neutral default (clean single-osc patch).
+  if (SNIFF_MODE) return param.defaultValue;
+
+  // Normal mode, no rule -> fully random (timbral params).
+  if (param.isQuantized) return Math.floor(Math.random() * nOpts);
   return param.min + Math.random() * span;
 }
 
@@ -124,9 +132,11 @@ export async function randomizeNotes(
   tracks: MidiTrack<ApiVersion>[],
 ): Promise<Record<string, NoteInfo>> {
   const recorded: Record<string, NoteInfo> = {};
+  // SNIFF_MODE pins to a fixed C3 so the test isolates waveform + envelope (no pitch variance).
+  const randomize = RANDOMIZE_NOTE && !SNIFF_MODE;
   for (const track of tracks) {
-    const pitch = RANDOMIZE_NOTE ? randInt(NOTE_PITCH_MIN, NOTE_PITCH_MAX) : NOTE_PITCH;
-    const velocity = RANDOMIZE_NOTE ? randInt(VELOCITY_MIN, VELOCITY_MAX) : NOTE_VELOCITY;
+    const pitch = randomize ? randInt(NOTE_PITCH_MIN, NOTE_PITCH_MAX) : NOTE_PITCH;
+    const velocity = randomize ? randInt(VELOCITY_MIN, VELOCITY_MAX) : NOTE_VELOCITY;
     await setClipNote(track, pitch, velocity);
     recorded[track.name] = { pitch, velocity };
   }

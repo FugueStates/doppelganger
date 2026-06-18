@@ -24,7 +24,7 @@ from .codec import ParamCodec
 from .config import AudioConfig
 
 
-def _load_audio(path: Path, target_sr: int, n_samples: int) -> np.ndarray:
+def _load_audio(path: Path, target_sr: int, n_samples: int, loop: bool = False) -> np.ndarray:
     data, sr = sf.read(str(path), dtype="float32", always_2d=True)
     mono = data.mean(axis=1)
     if sr != target_sr:
@@ -34,9 +34,14 @@ def _load_audio(path: Path, target_sr: int, n_samples: int) -> np.ndarray:
     peak = np.abs(mono).max()
     if peak > 1e-6:
         mono = mono / peak
-    # fixed length: truncate or zero-pad at the end
+    # fixed length: truncate, or fill the window. Training uses zero-pad (note + release
+    # then silence, matching the rendered targets). Inference on SHORT clips (loop=True)
+    # TILES instead, so a 0.3 s stab fills the 3 s window with sustained content the model
+    # was trained on, rather than 2.7 s of silence that throws the encoder out of domain.
     if len(mono) >= n_samples:
         mono = mono[:n_samples]
+    elif loop and len(mono) > 0:
+        mono = np.tile(mono, int(np.ceil(n_samples / len(mono))))[:n_samples]
     else:
         mono = np.pad(mono, (0, n_samples - len(mono)))
     return mono.astype(np.float32)

@@ -67,10 +67,14 @@ export const RENDER_SECONDS = 3.0;
 export type Rule =
   | { kind: "forceMax" } // quantized toggle -> "On"
   | { kind: "forceIndex"; index: number } // quantized -> a specific option
+  | { kind: "forceValue"; value: number } // absolute raw value (clamped to [min,max])
+  | { kind: "randomChoice"; indices: number[] } // quantized -> random pick from a set
   | { kind: "fracRange"; lo: number; hi: number }; // sample within a fraction of [min,max]
 
 const forceMax: Rule = { kind: "forceMax" };
 const forceIndex = (index: number): Rule => ({ kind: "forceIndex", index });
+const forceValue = (value: number): Rule => ({ kind: "forceValue", value });
+const randomChoice = (indices: number[]): Rule => ({ kind: "randomChoice", indices });
 const frac = (lo: number, hi: number): Rule => ({ kind: "fracRange", lo, hi });
 
 function buildSamplingRules(): Record<string, Rule> {
@@ -96,6 +100,60 @@ function buildSamplingRules(): Record<string, Rule> {
 }
 
 export const SAMPLING_RULES: Record<string, Rule> = buildSamplingRules();
+
+/**
+ * SNIFF-TEST MODE (matcher-v3 branch). When true, "Randomize Batch" / "Auto Collect"
+ * generate the minimal validation set: a SINGLE oscillator (A) playing one of four basic
+ * waveforms with a random ADSR envelope, EVERYTHING else neutral/off. This is the gate for
+ * the rebuilt matcher — if it can't learn waveform + envelope from these, the method is
+ * wrong. Collect ~512 (≈8 batches of 64), then train `doppelganger.matcher.train_matcher`.
+ *
+ * SET FALSE before any full-timbre data collection. In sniff mode the note is pinned to C3.
+ */
+export const SNIFF_MODE = true;
+/** Osc-A Wave indices for the 4 basic waveforms (from the schema valueItems):
+ *  0 = Sine, 9 = Saw 64, 17 = Square 64, 19 = Triangle. */
+export const SNIFF_WAVEFORMS = [0, 9, 17, 19];
+
+function buildSniffRules(): Record<string, Rule> {
+  return {
+    // global: audible, neutral, deterministic
+    "Device On": forceMax,
+    Volume: forceValue(0.8),
+    Algorithm: forceIndex(0),
+    Transpose: forceValue(0), // 0 semitones
+    Spread: forceValue(0),
+    "Glide On": forceIndex(0),
+    Panorama: forceValue(0),
+    // oscillator A = the only voice; sweep its waveform + amp envelope
+    "Osc-A On": forceMax,
+    "Osc-A Level": forceMax,
+    "Osc-A Wave": randomChoice(SNIFF_WAVEFORMS),
+    "Osc-A Feedb": forceValue(0), // no feedback (keeps the waveform clean)
+    "A Fix On ": forceIndex(0), // tracks the note
+    "A Coarse": forceValue(1), // ratio 1
+    "A Fine": forceValue(0),
+    "Ae Mode": forceIndex(0), // None = standard ADSR
+    "Ae Init": forceValue(0),
+    "Ae Peak": forceMax,
+    "Ae Attack": frac(0, 1), // <-- the four things we actually vary + learn
+    "Ae Decay": frac(0, 1),
+    "Ae Sustain": frac(0, 1),
+    "Ae Release": frac(0, 1),
+    // silence the other oscillators and all timbre-coloring sections
+    "Osc-B On": forceIndex(0),
+    "Osc-C On": forceIndex(0),
+    "Osc-D On": forceIndex(0),
+    "Filter On": forceIndex(0),
+    "LFO On": forceIndex(0),
+    "Pe On": forceIndex(0),
+    "Shaper Mix": forceValue(0),
+    "Shaper Drive": forceValue(0),
+  };
+}
+
+/** Active rule set when SNIFF_MODE; unruled params fall back to their neutral default. */
+export const SNIFF_RULES: Record<string, Rule> = buildSniffRules();
 
 // --- Output paths (absolute on this machine) -------------------------------
 export const REPO_ROOT = "D:/AbletonExtensions/doppelganger";

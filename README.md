@@ -236,16 +236,20 @@ uv run python -m doppelganger.matcher.train_matcher --epochs 60
 #   flags: --w-audio/--w-param/--w-algo (loss weights) --batch-size N --algo-topk N
 
 # inference: match a target sound -> ranked candidate presets -> predict manifest
-uv run python -m doppelganger.matcher.match --target "dataset\operator\wav\0000000.wav" `
-    --note 60 --velocity 100 --candidates 5
-# then in Live: right-click -> "doppelganger: Apply Predicted Batch" -> Export to hear them
-# (op_0000 = best-ranked of the top-k-algorithm predictions)
+uv run python -m doppelganger.matcher.match --target "input.wav"            # auto pitch
+uv run python -m doppelganger.matcher.match --target "render.wav" --note 60 # forced pitch
+# then in Live: right-click -> "doppelganger: Apply Predicted Batch", play the reported
+# MIDI note, and Export to hear them (op_0000 = best)
 ```
 
-The matcher predicts one preset per top-k Algorithm (`--candidates`), renders them through
-the frozen **neural** renderer (CPU, no real render), and ranks by spectral loss — robust
-to the weak Algorithm classifier. Pass the played `--note/--velocity` (the renderer is
-pitch-conditioned); automatic f0 detection is a Tool-3 follow-up.
+Over a grid of {candidate pitches} × {top-k Algorithms} the matcher predicts one preset per
+cell, renders them through the frozen **neural** renderer (CPU, no real render), and ranks
+by spectral loss. Input robustness (so it "gives any sound a shot"): `--note auto` (default)
+detects the dominant pitch and sweeps ±octaves (pitch is ambiguous for chords); short clips
+are tiled to fill the window instead of padded to silence. Pass an explicit `--note N` for
+an exact in-domain test. **Operator is monophonic**, so a chord comes back as a single FM
+tone approximating its *timbre*, not the chord — validated in-domain at ~57% of the
+achievable match gap; see [docs/matcher-design.md](docs/matcher-design.md).
 
 ### In-the-loop CMA-ES search (real Operator, optional inference polish)
 Refines a preset directly against the real Operator (population 64 = one export):
@@ -303,8 +307,14 @@ run but are not part of the current workflow.
     silent/extreme values that gamed the renderer's slack (Volume→−∞, Transpose→+48);
     replaced by the manifold-bounded deterministic predictor above, which is also the
     simplest thing to ship as ONNX in the extension.
-  - **Next:** train on the box vs the real renderer; read eval `gain%` + Algorithm acc, then
-    hear `op_0000` via Apply Predicted Batch.
+  - **Validated in-domain (2026-06-17):** on held-out single-note renders it closes ~57% of
+    the *achievable* (mean→true-params-floor) match gap. Inference hardened for arbitrary
+    inputs (auto pitch detect + ±octave sweep + short-clip tiling) — a 0.28 s chord stab
+    went from dial-up noise to a sensible timbre approximation (−32% renderer loss).
+  - **Next:** **chord training data** — render presets playing chords, pair `(chord audio →
+    that preset)`, retrain so the matcher maps a chord's *instrument timbre* to an emulating
+    monophonic patch (param-anchor does the teaching; renderer unchanged). See
+    `docs/matcher-design.md`.
 - ⬜ Tool 3 (inference extension) — `matcher.onnx` (+ optional `renderer.onnx` ranker) on
   CPU in-extension, + YIN pitch detection on the input. Not yet built.
 - ⬜ (Dev-only, optional) CMA-ES polish against the real Operator (`synth/search.py`) — a

@@ -63,11 +63,55 @@ in-range (`Volume 0.77`, `Transpose 0.62`, `Device On 1`) instead of silent/rail
 
 ### v2 inference (`match.py`) + deployment
 
-Encode → classify Algorithm → predict ONE preset per top-k algorithm → render all through
-the frozen **neural** renderer (CPU, no real render) → rank by spectral loss → `op_0000` =
-best. The whole path is what ships: `matcher.onnx` (+ optionally `renderer.onnx` for the
-in-extension ranking) running on CPU. CMA-ES against the real Operator stays a separate
-dev-only polish, not part of the extension.
+Encode → classify Algorithm → over a grid of {candidate pitches} × {top-k algorithms}
+predict one preset per cell → render all through the frozen **neural** renderer (CPU, no
+real render) → rank by spectral loss → `op_0000` = best. The whole path is what ships:
+`matcher.onnx` (+ optionally `renderer.onnx` for the in-extension ranking) running on CPU.
+CMA-ES against the real Operator stays a separate dev-only polish, not part of the extension.
+
+### v2 validation (2026-06-17) — it works in-domain
+
+On 20 held-out single-note renders matched at their true pitch: rendering the *true* params
+(the achievable floor, since the renderer isn't perfect) closes 59.7% of the mean→0 gap;
+the **matcher closes 34.3%**, i.e. **~57% of the achievable (mean→floor) gap** — many
+samples 50–75%. So the matcher genuinely gets over halfway to the best a perfect matcher
+could do. It's inconsistent and has headroom (conditioning is the likely ceiling), but it's
+a working matcher, not noise.
+
+### v2.1 inference robustness — "give any sound a shot" (2026-06-17)
+
+Out-of-domain inputs (a real instrument, a short stab, a chord) were producing
+dial-up-like noise. Diagnosis on a 0.28 s chord stab: three input-handling problems, all
+fixable WITHOUT retraining, none about the model:
+- **fixed C3 pitch** — the renderer is pitch-conditioned, so matching at the wrong pitch
+  is hopeless. `match.py --note auto` (default) detects the dominant pitch from the
+  strongest spectral peak.
+- **ambiguous pitch** (chords / inharmonic input have no single pitch, and octave errors
+  are the common detector failure) — so we **sweep ±octaves** around the estimate and let
+  the renderer-ranking pick (pitch × top-k-algorithm grid).
+- **short clips** — a 0.28 s clip zero-padded to 3 s is 2.7 s of silence, wildly
+  out-of-domain. `_load_audio(loop=True)` **tiles** short clips to fill the window with
+  sustained content like the training data.
+
+Measured on the 0.28 s chord: best renderer loss 3.46 (pad + C3) → **2.36** (tile + auto
+pitch + sweep), a ~32% improvement from input handling alone.
+
+**Hard limit (by design, not a bug):** Operator is monophonic — it cannot reproduce a
+chord. The best it returns is a single FM tone approximating the chord's *timbre*. To do
+better on polyphonic instrument input, see the chord-training-data plan below.
+
+### Next: chord training data (planned)
+
+To make the matcher map a CHORD played by an instrument → the monophonic Operator preset
+that *emulates that instrument's sound* (not reproduce the chord): generate training pairs
+`(audio of a preset playing a chord  →  that same preset)`. Mechanism, reusing the existing
+pipeline: extend the data-collection extension to render presets with **multi-note (chord)
+clips** instead of one note; pair the chord render with the preset that made it. Train the
+matcher on these alongside the single-note data. The **param-anchor** does the teaching
+here — it maps chord-audio directly to the true preset (the audio-loss term is only a soft
+guide on chord targets, since the frozen renderer is monophonic and renders the predicted
+preset as a single note). The renderer needs no change. This teaches "polyphonic instrument
+timbre → the synth patch whose single-note voice matches it," which is exactly the goal.
 
 ---
 

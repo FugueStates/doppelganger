@@ -278,8 +278,28 @@ methodology — **isolate, validate, expand**:
   (presence via cutoff for now; gated-binary later), circuits/drive/morph/vel-key/LFO neutral,
   and the whole `Fe` envelope pinned to defaults (inert at Amount 0).
 - **Probes:** `FTYPE_ACC`, `CUTOFF_MAE`, `RES_MAE` (auto-appear when in scope), in gate score.
-- **Plan:** collect ~10k Stage-3, train it ALONE first (does it read static cutoff/res/type
-  off the spectrum?), then a combined Stage-2+3 run to check no forgetting, then Stage 4.
+
+**Stage 3 — RESULT (9.4k, best ep55, listen ✅).** PASS. `CUTOFF_MAE=0.018` (as tight as the
+amp ADSR — cutoff reads cleanly off the spectrum, no perceptual loss needed) and
+`FTYPE_ACC=0.96` (LP/HP/BP spectrally distinct). `WAVE_ACC=1.0`, `ADSR_MAE=0.075`. The one
+soft spot is `RES_MAE=0.063` (~3.5× cutoff, plateaus ep45) — largely IDENTIFIABILITY: a
+resonant peak between the sparse harmonics of a static saw has nothing to color (same logic
+as the buried modulator ratio). Listen test on the 3 worst-case (max-resonance, one per type)
+samples: all indistinguishable from the originals → 0.063 is inaudible at this res cap.
+Expect Stage 4's sweep to tighten resonance for free (a moving peak crosses harmonics → far
+more observable) plus the planned magnitude-response loss weights the peak directly.
+
+**Mixing datasets — the filter-off → open relabel (`codec._filter_label`).** The FM stages
+were rendered with the filter OFF, but their params carry a stale mid-cutoff (~0.44) that
+never colored the audio. With the filter heads now learned, that would teach the cutoff head
+a wrong default for FM sounds. Fix: at encode, any filter-OFF sample is relabeled to a
+wide-open transparent filter (cutoff max, res 0, LP) — consistent with its unfiltered audio,
+and the correct "no filter ⇒ open" mapping for the always-on filter. `MatcherDataset` now
+accepts multiple roots (folder-namespaced ids, so `0000000` collisions across sets are
+avoided); `--data A B` mixes them.
+
+**Next:** combined Stage-2+3 run (`--data dataset/sniff_s2p dataset/sniff_filter`) — confirm
+FM (`RATIO_*`) and filter (`CUTOFF/FTYPE/RES`) both hold (no forgetting) — then Stage 4.
 
 ## Perceptual-weighting candidates (params where param-distance ≠ perceptual-distance)
 

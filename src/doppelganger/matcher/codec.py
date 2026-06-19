@@ -205,8 +205,19 @@ class ParamCodec:
                     new[_remap_osc(name, src, dst)] = val
         return new
 
+    def _filter_label(self, params: dict) -> dict:
+        """If the sample was rendered with the filter OFF, its audio is unfiltered — so the
+        consistent target for the always-on filter is 'wide open' (transparent): cutoff at
+        max, no resonance, lowpass. Without this, mixing filter-off data (the FM stages) with
+        filter-on data teaches the cutoff head a wrong default: the filter-off render carries
+        a stale mid-cutoff value that never actually colored the audio."""
+        if float(params.get("Filter On", 1.0)) >= 0.5:
+            return params
+        return {**params, "Filter Freq": 1.0, "Filter Res": 0.0, "Filter Type": 0.0}
+
     def encode(self, params: dict) -> EncodedTargets:
         params = self._canonicalize(params)
+        params = self._filter_label(params)
         cont = np.array([p.normalize(params.get(p.name, p.default)) for p in self.cont], dtype=np.float32)
         binary = np.array([p.normalize(params.get(p.name, p.default)) for p in self.binary], dtype=np.float32)
         cat = np.array([self._cat_class(p, r, params)

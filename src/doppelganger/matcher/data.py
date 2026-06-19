@@ -19,13 +19,23 @@ from .model import MatcherConfig
 
 
 class MatcherDataset(Dataset):
-    def __init__(self, root: str | Path, codec: ParamCodec, cfg: MatcherConfig):
-        self.root = Path(root)
+    def __init__(self, root: str | Path | list, codec: ParamCodec, cfg: MatcherConfig):
+        roots = [root] if isinstance(root, (str, Path)) else list(root)
+        self.roots = [Path(r) for r in roots]
         self.codec = codec
         self.cfg = cfg
-        self.ids = sorted(p.stem for p in (self.root / "params").glob("*.json"))
+        multi = len(self.roots) > 1   # namespace ids by folder when mixing sets (avoid stem collisions)
+        self.ids: list[str] = []
+        self._loc: dict[str, tuple[Path, str]] = {}
+        for r in self.roots:
+            for p in sorted((r / "params").glob("*.json")):
+                sid = f"{r.name}/{p.stem}" if multi else p.stem
+                self.ids.append(sid)
+                self._loc[sid] = (r, p.stem)
+        self.ids.sort()
         if not self.ids:
-            raise RuntimeError(f"No params under {self.root/'params'} — collect data first.")
+            roots_str = ", ".join(str(r / "params") for r in self.roots)
+            raise RuntimeError(f"No params under {roots_str} — collect data first.")
         self._cache: dict[str, tuple] = {}
 
     def __len__(self):
@@ -37,8 +47,9 @@ class MatcherDataset(Dataset):
     def __getitem__(self, i: int):
         sid = self.ids[i]
         if sid not in self._cache:
-            params = json.loads((self.root / "params" / f"{sid}.json").read_text())["params"]
-            audio = _load_audio(self.root / "wav" / f"{sid}.wav",
+            r, stem = self._loc[sid]
+            params = json.loads((r / "params" / f"{stem}.json").read_text())["params"]
+            audio = _load_audio(r / "wav" / f"{stem}.wav",
                                 self.cfg.sample_rate, self.cfg.n_samples)
             e = self.codec.encode(params)
             self._cache[sid] = (

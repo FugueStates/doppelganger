@@ -133,7 +133,8 @@ def evaluate(model, loader, device, watch, env_spec):
 def main():
     root = _repo_root()
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", default=str(root / "dataset" / "sniff"))
+    ap.add_argument("--data", nargs="+", default=[str(root / "dataset" / "sniff")],
+                    help="one or more dataset dirs (mixed with folder-namespaced ids)")
     ap.add_argument("--out", default=str(root / "models" / "operator" / "matcher_v3.pt"))
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--batch-size", type=int, default=32)

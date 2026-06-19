@@ -46,16 +46,15 @@ N_RATIO = 49  # classes 0..48
 #   • Fine detune + oscillator feedback (edge-pinned at 0)
 #   • Transpose + per-osc Freq<Vel — global/velocity pitch offsets, pinned to 0 so pitch is
 #     exactly the played note (a stray -0.05 semitone Transpose was audibly flattening it)
-# Filter stage (matcher-v3 Stage 3: STATIC filter). The model LEARNS the perceptually
-# dominant static-filter controls — Filter Type / Freq / Res / Slope stay as heads. The rest
-# of the filter section is out of scope for now and frozen:
+# Filter stage (matcher-v3 Stages 3–4). The model LEARNS the perceptually dominant filter
+# controls: static — Filter Type / Freq / Res / Slope (Stage 3); sweep — Fe Amount + the
+# Fe A/D/S/R envelope (Stage 4). The rest of the filter section is out of scope and frozen:
 #   • Filter ENGAGED (On pinned on): presence is handled by cutoff (a wide-open lowpass ≈
 #     transparent); making On a gated binary is a later expansion.
 #   • circuits / drive / morph / vel-key / LFO routing: secondary coloring, pinned neutral.
-#   • the filter ENVELOPE: Fe Amount 0 ⇒ NO sweep (static filter). The sweep is the Stage-4
-#     expansion (expected to need a perceptual loss, as the amp envelope did) — unfreeze the
-#     Fe ADSR + Fe Amount then. (The remaining inert Fe params are pinned to schema default in
-#     ParamCodec.__init__ via FILTER_ENV_FROZEN, since they need the schema to resolve.)
+#   • the filter-envelope SHAPING (Fe Init/Peak/End, slopes, Mode/Loop/Retrig): pinned to
+#     schema defaults → a standard ADSR (Init 0, Peak 1, End 0). Resolved in
+#     ParamCodec.__init__ via FILTER_ENV_FROZEN (needs the schema).
 FILTER_FROZEN: dict[str, float] = {
     "Filter On": 1.0,
     "Filter Circuit - LP/HP": 0.0,           # Clean
@@ -65,12 +64,10 @@ FILTER_FROZEN: dict[str, float] = {
     "Filt < Vel": 0.0,
     "Filt < Key": 0.0,
     "Filt < LFO": 0.0,
-    "Fe Amount": 0.0,                        # no filter-envelope sweep (Stage 4 unfreezes)
 }
 FILTER_ENV_FROZEN = (
-    "Fe Attack", "Fe Init", "Fe A Slope", "Fe Decay", "Fe Peak", "Fe D Slope",
-    "Fe Sustain", "Fe Release", "Fe End", "Fe R Slope", "Fe Mode", "Fe Loop",
-    "Fe Retrig", "Fe R < Vel",
+    "Fe Init", "Fe A Slope", "Fe Peak", "Fe D Slope", "Fe End", "Fe R Slope",
+    "Fe Mode", "Fe Loop", "Fe Retrig", "Fe R < Vel",
 )
 
 FROZEN_DEFAULT: dict[str, float] = {

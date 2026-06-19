@@ -159,7 +159,7 @@ function buildSniffRules(): Record<string, Rule> {
  * collector generates. Stage 0 (passed): single-osc waveform+ADSR. Stage 1: 2-operator
  * FM (B->A) — adds the modulator (Osc-B) ratio + level, the core FM controls.
  */
-export const COLLECTION_STAGE: number = 3;
+export const COLLECTION_STAGE: number = 4;
 
 /** Stage 1 — 2-operator FM. Carrier A (waveform + amp env, pitch = note) modulated by B
  *  (sine, varying ratio + level = modulation index, steady envelope). C/D off; the linear
@@ -336,9 +336,77 @@ function buildStage3Rules(): Record<string, Rule> {
   };
 }
 
+/** Stage 4 — FILTER ENVELOPE SWEEP sniff. Single rich carrier (saw/square), but the amp
+ *  envelope is held STATIC (sustained) so the only temporal contour is the filter sweep —
+ *  isolating the filter envelope. The filter is engaged with a LOW base cutoff + a POSITIVE
+ *  Fe Amount (a clear upward "wah"); the swept controls Fe Amount + Fe A/D/S/R vary, while
+ *  the secondary Fe shaping (Init/Peak/End/slopes/Mode) is pinned to a standard ADSR. The
+ *  codec learns Fe Amount + Fe A/D/S/R (see codec.py FILTER_FROZEN/FILTER_ENV_FROZEN) and
+ *  the trainer adds the cutoff-trajectory loss. No FM (B/C/D silent). Note pinned C3. */
+function buildStage4Rules(): Record<string, Rule> {
+  return {
+    "Device On": forceMax,
+    Volume: forceValue(0.8),
+    Algorithm: forceIndex(0),
+    Transpose: forceValue(0),
+    Spread: forceValue(0),
+    "Glide On": forceIndex(0),
+    Panorama: forceValue(0),
+    // carrier A: rich waveform, pitch = note, STATIC amp envelope (sustained) so only the
+    // filter moves over time
+    "Osc-A On": forceMax,
+    "Osc-A Level": forceMax,
+    "Osc-A Wave": randomChoice([9, 17]), // Saw 64 / Square 64
+    "Osc-A Feedb": forceValue(0),
+    "A Fix On ": forceIndex(0),
+    "A Coarse": forceValue(1),
+    "A Fine": forceValue(0),
+    "Ae Mode": forceIndex(0),
+    "Ae Init": forceValue(0),
+    "Ae Peak": forceMax,
+    "Ae Attack": forceValue(0), // sustained: instant on, full hold, short release
+    "Ae Decay": forceValue(0),
+    "Ae Sustain": forceMax,
+    "Ae Release": forceValue(0.1),
+    // B/C/D silent — no FM
+    "Osc-B On": forceIndex(0),
+    "Osc-C On": forceIndex(0),
+    "Osc-D On": forceIndex(0),
+    // filter engaged, LOW base cutoff with room to sweep UP
+    "Filter On": forceMax,
+    "Filter Type": randomChoice([0, 1, 2]), // LP / HP / BP
+    "Filter Freq": frac(0.1, 0.45), // low base — leaves headroom for the upward sweep
+    "Filter Res": frac(0.0, 0.5), // some resonance makes the swept peak audible
+    "Filter Slope": randomChoice([0, 1]),
+    "Filter Morph": forceValue(0),
+    "Filter Drive": forceValue(0),
+    "Filter Circuit - LP/HP": forceIndex(0),
+    "Filter Circuit - BP/NO/Morph": forceIndex(0),
+    "Filt < Vel": forceValue(0),
+    "Filt < Key": forceValue(0),
+    "Filt < LFO": forceIndex(0),
+    // THE FILTER ENVELOPE — the Stage-4 learning target
+    "Fe Mode": forceIndex(0), // None = standard ADSR
+    "Fe Init": forceValue(0), // standard ADSR shape (start at 0)
+    "Fe Peak": forceMax, // peak at 1
+    "Fe End": forceValue(0), // end at 0
+    "Fe Amount": frac(0.6, 1.0), // POSITIVE sweep depth (range -100..100 → +20..+100)
+    "Fe Attack": frac(0, 1), // <-- swept envelope (the perceptual sweep shape)
+    "Fe Decay": frac(0, 1),
+    "Fe Sustain": frac(0, 1),
+    "Fe Release": frac(0, 1),
+    // other timbre-coloring sections off
+    "LFO On": forceIndex(0),
+    "Pe On": forceIndex(0),
+    "Shaper Mix": forceValue(0),
+    "Shaper Drive": forceValue(0),
+  };
+}
+
 /** Active rule set when SNIFF_MODE; unruled params fall back to their neutral default. */
 export const SNIFF_RULES: Record<string, Rule> =
-  COLLECTION_STAGE >= 3 ? buildStage3Rules()
+  COLLECTION_STAGE >= 4 ? buildStage4Rules()
+    : COLLECTION_STAGE === 3 ? buildStage3Rules()
     : COLLECTION_STAGE === 2 ? buildStage2Rules()
     : COLLECTION_STAGE === 1 ? buildStage1Rules()
     : buildSniffRules();

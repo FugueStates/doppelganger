@@ -72,7 +72,38 @@ def envelope_l1(cont_pred, cont_true, env_spec):
     return tot / wsum.clamp_min(1.0)
 
 
-def compute_loss(model, out, batch, sigma, env_spec, w_env):
+def build_filt_spec(cont_names: list[str], cfg: MatcherConfig, device, n_t: int = 200,
+                    note_off: float = 1.5):
+    """Indices for the cutoff-trajectory loss: filter envelope (Fe ADSR) + sweep depth
+    (Fe Amount) + base cutoff (Filter Freq). None if the sweep isn't in scope (pre-Stage 4)."""
+    need = ("Fe Attack", "Fe Decay", "Fe Sustain", "Fe Release", "Fe Amount", "Filter Freq")
+    if not all(n in cont_names for n in need):
+        return None
+    fa, fd, fs, fr, amt, freq = (cont_names.index(n) for n in need)
+    return {"fa": fa, "fd": fd, "fs": fs, "fr": fr, "amt": amt, "freq": freq,
+            "t": torch.linspace(0.0, cfg.n_samples / cfg.sample_rate, n_t, device=device),
+            "note_off": note_off, "calib": CalibConstants()}
+
+
+def cutoff_l1(cont_pred, cont_true, filt_spec):
+    """Mean L1 between predicted and true CUTOFF TRAJECTORIES (normalized): base cutoff +
+    signed sweep depth × filter-envelope curve, clamped to [0,1]. The spectral parallel to
+    envelope_l1 — it penalizes a Fe-param error by its actual swept-cutoff (perceptual)
+    impact, so a moderate Fe Decay error that flips a slow 'wah' into a fast pluck-filter
+    costs a lot while an inaudible one costs ~nothing. Differentiable in cont_pred."""
+    s, (t, no, cal) = filt_spec, (filt_spec["t"], filt_spec["note_off"], filt_spec["calib"])
+    ck = cal.env_curve
+
+    def traj(p):
+        env = adsr(p[:, s["fa"]], p[:, s["fd"]], p[:, s["fs"]], p[:, s["fr"]], t, no,
+                   cal.max_attack, cal.max_decay, cal.max_release, ck, ck, ck)   # [B,T] in [0,1]
+        signed = (2 * p[:, s["amt"]] - 1).unsqueeze(1)        # Fe Amount norm [0,1] -> [-1,1]
+        base = p[:, s["freq"]].unsqueeze(1)
+        return (base + signed * env).clamp(0, 1)
+    return (traj(cont_pred) - traj(cont_true)).abs().mean()
+
+
+def compute_loss(model, out, batch, sigma, env_spec, w_env, filt_spec, w_filt):
     _, cont, binary, cat, cont_m, bin_m, cat_m = batch
     # continuous: soft cross-entropy over K bins
     soft = model.codec.soft_bins(cont, sigma)                       # [B,n_cont,K]
@@ -86,21 +117,24 @@ def compute_loss(model, out, batch, sigma, env_spec, w_env):
     cat_ce = torch.stack([F.cross_entropy(s, cat[:, j], reduction="none")
                           for j, s in enumerate(model.cat_slices(out["cat_logits"]))], dim=1)
     l_cat = _masked_mean(cat_ce, cat_m)
-    # envelope-shape loss: render pred (soft-decoded) vs true ADSR curves, L1
+    # envelope-shape loss (amp ADSR) + cutoff-trajectory loss (filter sweep): both render
+    # pred (soft-decoded) vs true CURVES and L1 them — perceptual weighting, no synth.
     cont_pred = model.codec.expected_value(out["cont_logits"].softmax(-1))
     l_env = envelope_l1(cont_pred, cont, env_spec)
-    total = l_cont + l_bin + l_cat + w_env * l_env
-    return total, (l_cont.item(), l_bin.item(), l_cat.item(), l_env.item())
+    l_filt = cutoff_l1(cont_pred, cont, filt_spec) if filt_spec is not None else cont_pred.new_zeros(())
+    total = l_cont + l_bin + l_cat + w_env * l_env + w_filt * l_filt
+    return total, (l_cont.item(), l_bin.item(), l_cat.item(), l_env.item(), float(l_filt))
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, watch, env_spec):
+def evaluate(model, loader, device, watch, env_spec, filt_spec):
     """`watch` = list of (label, 'cat'|'cont', index-or-index-list) — per-param probes
     (cat -> accuracy, cont -> MAE) on top of the overall masked cont_mae/cat_acc/bin_acc.
-    Also reports ENV_MAE: the perceptual envelope-curve L1 (the metric the env loss targets)."""
+    Also reports ENV_MAE (amp envelope-curve L1) and, once the filter sweep is in scope,
+    FILT_MAE (the cutoff-trajectory L1 the filter loss targets)."""
     model.eval()
     cont_ae = cont_n = cat_hit = cat_n = bin_hit = bin_n = 0.0
-    env_sum = env_n = 0.0
+    env_sum = env_n = filt_sum = 0.0
     w_acc = {w[0]: [0.0, 0.0] for w in watch if w[1] == "cat"}
     w_mae = {w[0]: [0.0, 0.0] for w in watch if w[1] == "cont"}
     cat_idx = {w[0]: w[2] for w in watch if w[1] == "cat"}
@@ -123,10 +157,14 @@ def evaluate(model, loader, device, watch, env_spec):
             w_mae[lbl][0] += ((pc[:, idxs] - cont[:, idxs]).abs() * wgt).sum().item()
             w_mae[lbl][1] += wgt.sum().item()
         env_sum += envelope_l1(pc, cont, env_spec).item() * audio.shape[0]; env_n += audio.shape[0]
+        if filt_spec is not None:
+            filt_sum += cutoff_l1(pc, cont, filt_spec).item() * audio.shape[0]
     m = {lbl: h / max(n, 1) for lbl, (h, n) in w_acc.items()}
     m.update({lbl: ae / max(n, 1) for lbl, (ae, n) in w_mae.items()})
     m.update(cont_mae=cont_ae / max(cont_n, 1), cat_acc=cat_hit / max(cat_n, 1),
              bin_acc=bin_hit / max(bin_n, 1), ENV_MAE=env_sum / max(env_n, 1))
+    if filt_spec is not None:
+        m["FILT_MAE"] = filt_sum / max(env_n, 1)
     return m
 
 
@@ -143,6 +181,7 @@ def main():
     ap.add_argument("--bins", type=int, default=64, help="bins per continuous param (finer = better envelope precision)")
     ap.add_argument("--sigma", type=float, default=1.5, help="Gaussian soft-label width (bins)")
     ap.add_argument("--w-env", type=float, default=1.0, help="weight of the envelope-shape loss")
+    ap.add_argument("--w-filt", type=float, default=1.0, help="weight of the cutoff-trajectory loss")
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--eval-every", type=int, default=5)
@@ -181,7 +220,13 @@ def main():
         watch.append(("CUTOFF_MAE", "cont", [cont_names.index("Filter Freq")]))
     if "Filter Res" in cont_names:
         watch.append(("RES_MAE", "cont", [cont_names.index("Filter Res")]))
+    if "Fe Attack" in cont_names:      # filter-envelope sweep (Stage 4+)
+        watch.append(("FE_MAE", "cont", [cont_names.index(n) for n in
+                      ("Fe Attack", "Fe Decay", "Fe Sustain", "Fe Release")]))
+    if "Fe Amount" in cont_names:
+        watch.append(("AMT_MAE", "cont", [cont_names.index("Fe Amount")]))
     env_spec = build_env_spec(cont_names, cfg, device)
+    filt_spec = build_filt_spec(cont_names, cfg, device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -192,26 +237,30 @@ def main():
     best = -1.0
     for epoch in range(1, args.epochs + 1):
         model.train()
-        agg = [0.0, 0.0, 0.0, 0.0]; nb = 0
+        agg = [0.0] * 5; nb = 0
         for batch in tr_dl:
             batch = [b.to(device) for b in batch]
             out_ = model(batch[0])
-            loss, parts = compute_loss(model, out_, batch, args.sigma, env_spec, args.w_env)
+            loss, parts = compute_loss(model, out_, batch, args.sigma, env_spec, args.w_env,
+                                       filt_spec, args.w_filt)
             opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-            for k in range(4): agg[k] += parts[k]
+            for k in range(len(parts)): agg[k] += parts[k]
             nb += 1
         sched.step()
+        ft = f" filt={agg[4]/nb:.3f}" if filt_spec is not None else ""
         if epoch % args.eval_every == 0 or epoch == args.epochs:
-            m = evaluate(model, va_dl, device, watch, env_spec)
-            # gate score: reward watched accuracies, penalize watched errors + envelope error
+            m = evaluate(model, va_dl, device, watch, env_spec, filt_spec)
+            # gate score: reward watched accuracies, penalize watched errors + curve losses
             score = (sum(m[w[0]] for w in watch if w[1] == "cat")
-                     - sum(m[w[0]] for w in watch if w[1] == "cont") - m["ENV_MAE"])
+                     - sum(m[w[0]] for w in watch if w[1] == "cont")
+                     - m["ENV_MAE"] - m.get("FILT_MAE", 0.0))
             improved = score > best
             probes = " ".join(f"{w[0]}={m[w[0]]:.3f}" for w in watch)
+            fm = f" FILT_MAE={m['FILT_MAE']:.3f}" if "FILT_MAE" in m else ""
             print(f"epoch {epoch:3} | train cont={agg[0]/nb:.3f} bin={agg[1]/nb:.3f} cat={agg[2]/nb:.3f} "
-                  f"env={agg[3]/nb:.3f} | {probes} ENV_MAE={m['ENV_MAE']:.3f} | "
+                  f"env={agg[3]/nb:.3f}{ft} | {probes} ENV_MAE={m['ENV_MAE']:.3f}{fm} | "
                   f"cont_mae={m['cont_mae']:.3f} cat_acc={m['cat_acc']:.3f} "
                   f"bin_acc={m['bin_acc']:.3f}{'  <- best' if improved else ''}")
             if improved:
@@ -220,7 +269,7 @@ def main():
                             "epoch": epoch, "metrics": m}, out)
         else:
             print(f"epoch {epoch:3} | train cont={agg[0]/nb:.3f} bin={agg[1]/nb:.3f} "
-                  f"cat={agg[2]/nb:.3f} env={agg[3]/nb:.3f}")
+                  f"cat={agg[2]/nb:.3f} env={agg[3]/nb:.3f}{ft}")
 
     print(f"Done. Best sniff score={best:.3f}. Saved -> {out}")
 

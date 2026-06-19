@@ -298,8 +298,33 @@ and the correct "no filter ⇒ open" mapping for the always-on filter. `MatcherD
 accepts multiple roots (folder-namespaced ids, so `0000000` collisions across sets are
 avoided); `--data A B` mixes them.
 
-**Next:** combined Stage-2+3 run (`--data dataset/sniff_s2p dataset/sniff_filter`) — confirm
-FM (`RATIO_*`) and filter (`CUTOFF/FTYPE/RES`) both hold (no forgetting) — then Stage 4.
+**Combined Stage-2+3 — RESULT (20k, best ep30).** No catastrophic forgetting + cross-benefit.
+FM held (`RATIO_B` 0.71 vs 0.74 — partly split noise, ids now namespaced; `RATIO_C` 0.25;
+`IDX_B` 0.037 better) and filter held/improved (`FTYPE_ACC` 0.99 vs 0.96, `RES_MAE` 0.049 vs
+0.063 — the diverse audio + FM-open samples regularized the filter heads, `CUTOFF_MAE` 0.023).
+One model does FM + static filter. Still NO FM-through-filter joint samples (deferred to the
+joint stage — see the data-strategy note).
+
+**Stage 4 — filter envelope sweep (2026-06-19, in progress).** The spectral analog of the amp
+envelope: a slow filter "wah" vs a fast pluck-filter is the same swell↔pluck perceptual flip,
+so it gets the same treatment — a targeted curve loss.
+- **Data (`buildStage4Rules`, `COLLECTION_STAGE=4`):** single rich carrier, **amp envelope
+  held STATIC (sustained)** so the only temporal contour is the filter sweep (isolates it;
+  amp ADSR is preserved via union with Stages 2/3). Filter engaged, LOW base cutoff +
+  POSITIVE `Fe Amount` → a clear upward sweep; `Fe A/D/S/R` varied. Secondary Fe shaping
+  (Init/Peak/End/slopes/Mode) pinned to a standard ADSR. No FM.
+- **Codec:** unfreezes `Fe Amount` + `Fe A/D/S/R` (n_cont 107→112).
+- **Loss (`cutoff_l1`, `--w-filt`):** render predicted vs true **cutoff trajectory** =
+  `clamp(base_cutoff + signed(Fe Amount)·adsr(Fe A/D/S/R, t), 0, 1)`, L1. Normalized cutoff is
+  ~log-Hz ≈ perceptual, so this is a cheap perceptual sweep-contour distance — no synth, no FM.
+  Exact parallel to `envelope_l1`. New probes `FE_MAE`, `AMT_MAE`, `FILT_MAE` (the trajectory
+  metric); `FILT_MAE` in the gate score.
+- **Plan:** collect ~10k Stage-4, train alone (does it read the sweep shape?), listen
+  (slow-wah vs pluck-filter), then combine with 2+3.
+- **Deferred to the combined run:** filter-off samples (Stages 2/3 in the union) carry
+  meaningless `Fe Amount/ADSR` — will need to gate the Fe params by sweep depth / `Filter On`
+  (the level-gating principle, applied to the filter). Fine for the Stage-4-alone sniff (all
+  samples have audible sweeps).
 
 ## Perceptual-weighting candidates (params where param-distance ≠ perceptual-distance)
 

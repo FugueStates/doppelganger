@@ -232,10 +232,59 @@ accuracy climbs above 0.38 after retrain. (Also explains "sounds close despite l
 the model nails the big perceptual factors + the dominant modulator; secondary ratios are
 finer/often interchangeable.)
 
+**Finding #8 — 10k run: data lifts everything EXCEPT the secondary-modulator ratio (the
+fundamental ceiling) (2026-06-17).** Scaled 3-op parallel to ~10.8k samples (2×3090 box,
+one GPU). Best ckpt (epoch ~20): WAVE_ACC **0.94** (was 0.86), ADSR_MAE **0.09** (0.13),
+RATIO_B/dominant **0.75** (0.61), IDX_B **0.05**, IDX_C 0.11 — all clearly improved toward
+their ceilings. But **RATIO_C/secondary stayed ~0.24** (was 0.26) — 14× the data didn't move
+it. → The secondary modulator's ratio is a **fundamental identifiability ceiling** (masked by
+the dominant, ambiguous from one note: the many-to-one wall), NOT overfitting. Everything
+perceptually dominant scales with data; the secondary is rough but perceptually minor (FM-
+forgiving; user heard "quite close"). **Conclusion: the FM core is done and good** — carrier
+(waveform/envelope) + dominant modulator reliably matched, secondary rough. Mild overfitting
+remains (best ~ep20, slight decline after; best-ckpt saves the peak) → early-stop ~ep30.
+
 ### Later stages
-4-op (more parallel modulators) → filter → feedback → …
+filter (next — biggest remaining timbral subsystem) → feedback → 4-op → …
+
+**Finding #9 — envelope param-loss ≠ perceptual-loss; added an envelope-shape loss
+(2026-06-17).** Sample 0008262 sounded wrong: the model's Ae ADSR was close (Attack/Release
+exact, Sustain near) but **Decay was 0.63 vs 0.92** — and that flipped a slow *swell* (decay
+so slow it never reaches the low sustain within the 1.5 s note) into a *pluck* (faster decay
+reaches the low sustain → crashes to ~0.08). A moderate param error, a huge perceptual one —
+because the binned param-loss penalizes Decay uniformly with no idea this region is
+perceptually explosive. (Two layers: identifiability — a non-completing slow decay is
+genuinely ambiguous from 1.5 s; and param≠perception.) **Fix (built):** an auxiliary
+**envelope-shape loss** in `train_matcher` — render each oscillator's predicted (soft-decoded)
+vs true ADSR amplitude CURVE via `diff_operator.adsr` and L1 them, level-weighted. This
+weights the envelope error by its actual *curve* impact (swell↔pluck → large gradient;
+inaudible decay error → ~none), cheap (1-D, no FM render, nothing to game), differentiable
+through the bins' expected value. New eval probe `ENV_MAE`; `--w-env` weight; folded into the
+gate score. This is the first instance of targeted perceptual weighting (below).
+
+## Perceptual-weighting candidates (params where param-distance ≠ perceptual-distance)
+
+Running list of params that most need perceptual weighting (Sound2Synth per-param MFCCD
+weighting / PNP) or a targeted perceptual loss — because a small parameter error there causes
+a large change in the *sound*. Add to this as stages surface them.
+
+| param(s) | why sensitive | status |
+|---|---|---|
+| **Envelope Decay** (then Attack/Release) | decay rate flips swell↔pluck near a low sustain; nonlinear time mapping | ✅ addressed by the envelope-shape loss (Finding #9) |
+| **Filter cutoff (Filter Freq)** | shifts the whole spectral balance; small move = big timbre change | ⏳ pending the filter stage — *expect to need it* |
+| **Filter resonance** | near self-oscillation a tiny change is drastic | ⏳ pending the filter stage |
+| **Modulator ratio (Coarse)** | wrong integer ratio = wrong harmonic character | handled via categorical head + index weighting |
+| **Modulation index (Osc Level, modulators)** | sets FM brightness | handled via level-gating (the weighting) |
+| **Feedback** | chaotic; small change → harsh/inharmonic shift | ⏳ when added (currently frozen off) |
+| **Waveshaper drive** | nonlinear; small change → big harmonic change | ⏳ when added |
+| **Sustain** (if dB-mapped) | perceptually log, not linear | watch via ENV_MAE |
+
+General mechanism to reach for: render the relevant differentiable sub-signal (envelope
+curve, or eventually a cheap spectral feature) and L1 it — a *targeted* perceptual loss that
+needs no full synth, rather than a uniform param loss.
 
 ## Open levers (when needed)
 - Per-param perceptual loss weighting (Sound2Synth, via `sensitivity.py`).
 - `--bins 64` / larger `pool_t` for finer continuous / temporal resolution.
-- Identifiability: constrain stimulus so asked-for params are observable.
+- Identifiability: constrain stimulus so asked-for params are observable (longer render for
+  slow envelopes).

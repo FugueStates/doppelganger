@@ -159,7 +159,7 @@ function buildSniffRules(): Record<string, Rule> {
  * collector generates. Stage 0 (passed): single-osc waveform+ADSR. Stage 1: 2-operator
  * FM (B->A) — adds the modulator (Osc-B) ratio + level, the core FM controls.
  */
-export const COLLECTION_STAGE: number = 2;
+export const COLLECTION_STAGE: number = 3;
 
 /** Stage 1 — 2-operator FM. Carrier A (waveform + amp env, pitch = note) modulated by B
  *  (sine, varying ratio + level = modulation index, steady envelope). C/D off; the linear
@@ -277,9 +277,69 @@ function buildStage2Rules(): Record<string, Rule> {
   return { ...carrierAndGlobals, ...modulator("B", "Be"), ...modulator("C", "Ce") };
 }
 
+/** Stage 3 — STATIC FILTER sniff. A SINGLE harmonically-rich carrier (saw / square, so the
+ *  filter has partials to act on) + amp ADSR, with the global filter ENGAGED and swept:
+ *  Type (LP / HP / BP), Freq (cutoff), Res, Slope. The filter ENVELOPE is OFF (Fe Amount 0 →
+ *  STATIC filter); the sweep is Stage 4. No FM (B/C/D silent) so filter learning is ISOLATED
+ *  from the modulator-ratio identifiability ceiling. Note is pinned to C3 by SNIFF_MODE —
+ *  ideal here, since the cutoff is an absolute frequency and varying pitch would couple.
+ *  The codec freezes the rest of the filter section to match (circuits/drive/morph/vel-key/
+ *  LFO + the Fe envelope) — see matcher/codec.py FILTER_FROZEN. */
+function buildStage3Rules(): Record<string, Rule> {
+  return {
+    "Device On": forceMax,
+    Volume: forceValue(0.8),
+    Algorithm: forceIndex(0),
+    Transpose: forceValue(0),
+    Spread: forceValue(0),
+    "Glide On": forceIndex(0),
+    Panorama: forceValue(0),
+    // carrier A = the only voice: rich waveform (saw/square) + amp envelope, pitch = note
+    "Osc-A On": forceMax,
+    "Osc-A Level": forceMax,
+    "Osc-A Wave": randomChoice([9, 17]), // Saw 64 / Square 64 — rich harmonics for the filter
+    "Osc-A Feedb": forceValue(0),
+    "A Fix On ": forceIndex(0),
+    "A Coarse": forceValue(1),
+    "A Fine": forceValue(0),
+    "Ae Mode": forceIndex(0),
+    "Ae Init": forceValue(0),
+    "Ae Peak": forceMax,
+    "Ae Attack": frac(0, 1),
+    "Ae Decay": frac(0, 1),
+    "Ae Sustain": frac(0, 1),
+    "Ae Release": frac(0, 1),
+    // B/C/D silent — no FM, isolate the filter
+    "Osc-B On": forceIndex(0),
+    "Osc-C On": forceIndex(0),
+    "Osc-D On": forceIndex(0),
+    // THE GLOBAL FILTER — engaged + swept (the Stage-3 learning target)
+    "Filter On": forceMax,
+    "Filter Type": randomChoice([0, 1, 2]), // Lowpass / Highpass / Bandpass
+    "Filter Freq": frac(0.15, 0.9), // cutoff (avoid extremes that filter to near-silence)
+    "Filter Res": frac(0.0, 0.6), // resonance (max raw 1.25; stay below the self-osc squeal)
+    "Filter Slope": randomChoice([0, 1]), // 12 / 24 dB
+    "Filter Morph": forceValue(0),
+    "Filter Drive": forceValue(0),
+    "Filter Circuit - LP/HP": forceIndex(0), // Clean
+    "Filter Circuit - BP/NO/Morph": forceIndex(0), // Clean
+    "Filt < Vel": forceValue(0),
+    "Filt < Key": forceValue(0),
+    "Filt < LFO": forceIndex(0),
+    "Fe Amount": forceValue(0), // filter ENVELOPE off → static filter (Stage 4 unfreezes)
+    "Fe Mode": forceIndex(0),
+    // other timbre-coloring sections off
+    "LFO On": forceIndex(0),
+    "Pe On": forceIndex(0),
+    "Shaper Mix": forceValue(0),
+    "Shaper Drive": forceValue(0),
+  };
+}
+
 /** Active rule set when SNIFF_MODE; unruled params fall back to their neutral default. */
 export const SNIFF_RULES: Record<string, Rule> =
-  COLLECTION_STAGE >= 2 ? buildStage2Rules()
+  COLLECTION_STAGE >= 3 ? buildStage3Rules()
+    : COLLECTION_STAGE === 2 ? buildStage2Rules()
     : COLLECTION_STAGE === 1 ? buildStage1Rules()
     : buildSniffRules();
 

@@ -172,6 +172,14 @@ def main():
             watch.append((f"RATIO_{X}", "cat", cat_names.index(f"{X} Coarse")))
         if f"Osc-{X} Level" in cont_names:
             watch.append((f"IDX_{X}", "cont", [cont_names.index(f"Osc-{X} Level")]))
+    # filter probes (Stage 3+): appear once the filter section is in the predicted set.
+    # (Filter Slope is a binary head — folded into the overall bin_acc, no dedicated probe.)
+    if "Filter Type" in cat_names:
+        watch.append(("FTYPE_ACC", "cat", cat_names.index("Filter Type")))
+    if "Filter Freq" in cont_names:
+        watch.append(("CUTOFF_MAE", "cont", [cont_names.index("Filter Freq")]))
+    if "Filter Res" in cont_names:
+        watch.append(("RES_MAE", "cont", [cont_names.index("Filter Res")]))
     env_spec = build_env_spec(cont_names, cfg, device)
 
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

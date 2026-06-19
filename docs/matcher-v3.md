@@ -262,6 +262,25 @@ inaudible decay error → ~none), cheap (1-D, no FM render, nothing to game), di
 through the bins' expected value. New eval probe `ENV_MAE`; `--w-env` weight; folded into the
 gate score. This is the first instance of targeted perceptual weighting (below).
 
+**Stage 3 — static filter (2026-06-19, in progress).** Envelope loss validated (8262 +
+0000050 now match by ear), so moving to the filter. Stages 0–2 had the filter hard-off
+(`Filter On: forceIndex(0)`), so the 10k model never saw one. Mirroring the oscillator
+methodology — **isolate, validate, expand**:
+- **Data (`config.ts` `buildStage3Rules`, `COLLECTION_STAGE=3`):** a SINGLE harmonically-rich
+  carrier (saw/square — sine has nothing for a filter to act on) + amp ADSR, **no FM** (B/C/D
+  silent, so filter learning is isolated from the modulator-ratio ceiling), global filter
+  ENGAGED and swept: `Filter Type` (LP/HP/BP), `Filter Freq` (cutoff), `Filter Res`,
+  `Filter Slope`. Note pinned to C3 (cutoff is absolute Hz — varying pitch would couple).
+- **Static only:** `Fe Amount=0` → no filter-envelope sweep. The sweep is Stage 4 (expected
+  to need a perceptual loss, like the amp envelope did).
+- **Codec (`FILTER_FROZEN` + `FILTER_ENV_FROZEN`):** learns Type/Freq/Res; Slope is a binary
+  head (folded into `bin_acc`). Freezes the rest of the section — `Filter On` pinned on
+  (presence via cutoff for now; gated-binary later), circuits/drive/morph/vel-key/LFO neutral,
+  and the whole `Fe` envelope pinned to defaults (inert at Amount 0).
+- **Probes:** `FTYPE_ACC`, `CUTOFF_MAE`, `RES_MAE` (auto-appear when in scope), in gate score.
+- **Plan:** collect ~10k Stage-3, train it ALONE first (does it read static cutoff/res/type
+  off the spectrum?), then a combined Stage-2+3 run to check no forgetting, then Stage 4.
+
 ## Perceptual-weighting candidates (params where param-distance ≠ perceptual-distance)
 
 Running list of params that most need perceptual weighting (Sound2Synth per-param MFCCD

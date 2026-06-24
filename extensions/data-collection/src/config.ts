@@ -391,10 +391,15 @@ function buildStage4Rules(): Record<string, Rule> {
     "Fe Peak": forceMax, // peak at 1
     "Fe End": forceValue(0), // end at 0
     "Fe Amount": frac(0.6, 1.0), // POSITIVE sweep depth (range -100..100 → +20..+100)
-    "Fe Attack": frac(0, 1), // <-- swept envelope (the perceptual sweep shape)
-    "Fe Decay": frac(0, 1),
+    // The Fe time params are HEAVILY exponential (measured from audio): the bottom ~half of
+    // each is near-instant; the slow/multi-second tails (the "9 s sweeps" — unobservable in a
+    // 3 s render and unmusical on a 1.5 s note) sit in the top of Decay/Release. Attack maxes
+    // at only ~0.7 s so it's left full; Decay/Release are capped to keep sweeps inside the
+    // window. (First-cut caps — verify the new batch's sweeps complete, tighten if needed.)
+    "Fe Attack": frac(0, 1), // <-- swept envelope shape (attack is well-behaved, ≤~0.7 s)
+    "Fe Decay": frac(0, 0.65),
     "Fe Sustain": frac(0, 1),
-    "Fe Release": frac(0, 1),
+    "Fe Release": frac(0, 0.5),
     // other timbre-coloring sections off
     "LFO On": forceIndex(0),
     "Pe On": forceIndex(0),

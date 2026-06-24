@@ -37,11 +37,11 @@ class MatcherConfig:
     emb: int = 512
     # Pool to a freq x TIME grid, NOT a single vector: collapsing time (global avg pool)
     # discards exactly the temporal information the ADSR envelope lives in, so the model
-    # could learn the (spectral) waveform but not the (temporal) envelope. Keeping a (now
-    # finer, see ConvEncoder) time axis lets the param heads read attack/decay/sustain/release
-    # AND the faster filter-cutoff sweeps/plucks.
+    # could learn the (spectral) waveform but not the (temporal) envelope. Keeping a coarse
+    # time axis lets the param heads read attack/decay/sustain/release.
+    # (A 4x-finer time grid was tried for fast filter sweeps — no effect, so reverted.)
     pool_f: int = 4
-    pool_t: int = 32
+    pool_t: int = 16
 
 
 class ConvEncoder(nn.Module):
@@ -51,16 +51,9 @@ class ConvEncoder(nn.Module):
     def __init__(self, ch: int, emb: int, pool_f: int, pool_t: int):
         super().__init__()
         c = [1, ch, ch * 2, ch * 4, ch * 8]
-        # Downsample FREQUENCY aggressively (stride 2 every layer: 128->8) but TIME only 4x
-        # (stride-2 first two layers, stride-1 last two: ~188->47 frames, ~64 ms each). The
-        # earlier all-stride-2 collapsed time to ~12 frames (~250 ms), which blurred fast
-        # filter SWEEPS / plucks — a <100 ms cutoff snap vanished inside one frame (amplitude
-        # envelopes survived the coarse grid, but a moving spectral peak does not). Keeping
-        # ~64 ms frames lets the heads read the swept-cutoff trajectory.
-        strides = [(2, 2), (2, 2), (2, 1), (2, 1)]
         layers = []
         for i in range(4):
-            layers += [nn.Conv2d(c[i], c[i + 1], 3, stride=strides[i], padding=1),
+            layers += [nn.Conv2d(c[i], c[i + 1], 3, stride=2, padding=1),
                        nn.GroupNorm(8, c[i + 1]), nn.GELU()]
         self.net = nn.Sequential(*layers)
         self.pool = nn.AdaptiveAvgPool2d((pool_f, pool_t))   # collapse freq coarsely, KEEP time

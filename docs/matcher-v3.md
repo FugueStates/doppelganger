@@ -326,6 +326,31 @@ so it gets the same treatment — a targeted curve loss.
   (the level-gating principle, applied to the filter). Fine for the Stage-4-alone sniff (all
   samples have audible sweeps).
 
+**Stage 4 — RESULT (validated ✅, 2026-06-19).** First run looked perfect but was a STALE-DATA
+trap: the extension wasn't reloaded, so it re-collected Stage-3 (static) data — `Fe Amount=0`,
+no sweep — and the model trivially fit constant targets (`FE_MAE` 0.010). Caught by a param-
+variance check. *Lesson: always verify a fresh batch's target variance after a config change.*
+On real swept data: `FILT_MAE` 0.062, `FE_MAE` 0.142 — moderate, and crucially **a finer time
+grid (250→64 ms) changed nothing** (resolution refuted, reverted). DSP analysis showed `Fe`
+times are heavily exponential — `Fe Attack` maxes ~0.7 s (fine), but `Fe Decay/Release` tails
+ran to multi-second (the "9 s sweeps": unobservable in a 3 s render *and* unmusical). **Capping
+`Fe Decay` to `frac(0,0.65)` and `Fe Release` to `frac(0,0.5)`** dropped `FE_MAE` 0.142→0.099
+and `FILT_MAE`→0.057; listen test (plucks, resonant sweeps) — all close. The whole filter
+section now works. (`cutoff_l1` still uses the amp-env time calib — consistent pred/true, so
+second-order; noted for later.)
+
+**Fe gating for the union (`codec._gate_of` `@fe_sweep`).** The filter-envelope ADSR is only
+observable in proportion to SWEEP DEPTH, so it's gated by `|Fe Amount|/100` — exactly the
+level-gating principle, applied to the filter. Filter-off (FM) and static-filter samples have
+`Fe Amount=0` → `Fe ADSR` weight 0 (unsupervised, no corruption); deep sweeps → full weight.
+`_filter_label` also zeroes `Fe Amount` for filter-off samples.
+
+**Next: combined union (Stages 2+3+4).** `--data dataset/sniff_s2p dataset/sniff_filter
+dataset/sniff_filterenv` (30.8k). Confirm FM (`RATIO_*`), static filter (`CUTOFF/FTYPE/RES`),
+and sweep (`FE/AMT/FILT`) all hold together (no forgetting). Then the deployment-matching
+**joint stage** (everything co-varying — see the data-strategy note) — the actual end goal,
+since the union still has no FM-through-filter samples.
+
 ## Perceptual-weighting candidates (params where param-distance ≠ perceptual-distance)
 
 Running list of params that most need perceptual weighting (Sound2Synth per-param MFCCD

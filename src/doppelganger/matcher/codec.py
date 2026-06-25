@@ -70,6 +70,10 @@ FILTER_ENV_FROZEN = (
     "Fe Mode", "Fe Loop", "Fe Retrig", "Fe R < Vel",
 )
 
+# The filter-envelope ADSR is only observable in proportion to SWEEP DEPTH (how far the cutoff
+# actually moves) — gated by |Fe Amount| like a modulator's envelope is gated by its level.
+FE_ADSR = ("Fe Attack", "Fe Decay", "Fe Sustain", "Fe Release")
+
 FROZEN_DEFAULT: dict[str, float] = {
     **{f"{X} Fine": 0.0 for X in "ABCD"},
     **{f"Osc-{X} Feedb": 0.0 for X in "ABCD"},
@@ -100,8 +104,13 @@ def _remap_osc(name: str, src: str, dst: str) -> str:
 
 
 def _gate_of(name: str) -> str | None:
-    """The oscillator LEVEL that gates/weights this param's audibility (None if ungated).
-    A param of oscillator X is weighted by Osc-X Level; the level itself is never gated."""
+    """The gate that weights this param's audibility (None if ungated). A param of oscillator
+    X is weighted by Osc-X Level (the level itself is never gated). The filter-envelope ADSR
+    is weighted by SWEEP DEPTH via the '@fe_sweep' sentinel (resolved from Fe Amount in
+    _weight) — it's only observable in proportion to how far the cutoff moves. Same
+    perceptual-weighting principle, applied to the filter."""
+    if name in FE_ADSR:
+        return "@fe_sweep"
     o = _oscillator_of(name)
     if o is None:
         return None
@@ -171,11 +180,18 @@ class ParamCodec:
 
     @staticmethod
     def _weight(gates, params) -> np.ndarray:
-        """Per-param weight = controlling oscillator's level (0..1), 1.0 if ungated.
-        Continuous gate: level 0 -> weight 0 (params unsupervised, osc inaudible); level 1
-        -> full supervision. This is the perceptual weighting."""
-        return np.array([1.0 if g is None else min(1.0, max(0.0, float(params.get(g, 1.0))))
-                         for g in gates], dtype=np.float32)
+        """Per-param weight = controlling gate's value (0..1), 1.0 if ungated. Oscillator
+        gate: Osc-X Level (0 -> weight 0, params unsupervised/inaudible; 1 -> full). Filter-env
+        ADSR gate '@fe_sweep': sweep depth = |Fe Amount|/100 (Fe Amount range ±100), so the
+        envelope SHAPE is supervised only as far as the cutoff actually sweeps. Perceptual
+        weighting."""
+        def w(g):
+            if g is None:
+                return 1.0
+            if g == "@fe_sweep":
+                return min(1.0, abs(float(params.get("Fe Amount", 0.0))) / 100.0)
+            return min(1.0, max(0.0, float(params.get(g, 1.0))))
+        return np.array([w(g) for g in gates], dtype=np.float32)
 
     def _cat_class(self, p: Param, is_ratio: bool, params: dict) -> int:
         v = params.get(p.name, p.default)
@@ -210,7 +226,8 @@ class ParamCodec:
         a stale mid-cutoff value that never actually colored the audio."""
         if float(params.get("Filter On", 1.0)) >= 0.5:
             return params
-        return {**params, "Filter Freq": 1.0, "Filter Res": 0.0, "Filter Type": 0.0}
+        return {**params, "Filter Freq": 1.0, "Filter Res": 0.0, "Filter Type": 0.0,
+                "Fe Amount": 0.0}      # no filter -> no sweep (and Fe ADSR then gates to 0)
 
     def encode(self, params: dict) -> EncodedTargets:
         params = self._canonicalize(params)
